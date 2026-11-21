@@ -138,6 +138,17 @@ fn parse_iso_base(b: &[u8]) -> Option<i64> {
 }
 
 #[inline]
+fn parse_f1_unchecked(b: &[u8]) -> i64 {
+    let y = parse_4d(&b[0..4]).unwrap_or(0);
+    let m = parse_2d(&b[5..7]).unwrap_or(0);
+    let d = parse_2d(&b[8..10]).unwrap_or(0);
+    let hh = parse_2d(&b[11..13]).unwrap_or(0);
+    let mm = parse_2d(&b[14..16]).unwrap_or(0);
+    let ss = parse_2d(&b[17..19]).unwrap_or(0);
+    (days_from_civil(y, m, d) * 86_400 + (hh as i64) * 3600 + (mm as i64) * 60 + ss as i64) * 1000
+}
+
+#[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
     if b.is_empty() {
         return None;
@@ -275,8 +286,8 @@ fn morsels(data: &'static [u8]) -> Vec<(&'static [u8], bool)> {
 // Union-Find tracking byte-wise smallest user_id per component
 struct Dsu {
     parent: Vec<u32>,
-    names: Vec<Box<[u8]>>,
-    id_to_idx: FxHashMap<Box<[u8]>, u32>,
+    names: Vec<&'static [u8]>,
+    id_to_idx: FxHashMap<&'static [u8], u32>,
 }
 
 impl Dsu {
@@ -288,15 +299,14 @@ impl Dsu {
         }
     }
 
-    fn get_or_insert(&mut self, id: &[u8]) -> u32 {
+    fn get_or_insert(&mut self, id: &'static [u8]) -> u32 {
         if let Some(&idx) = self.id_to_idx.get(id) {
             return idx;
         }
         let idx = self.parent.len() as u32;
-        let boxed: Box<[u8]> = id.into();
         self.parent.push(idx);
-        self.names.push(boxed.clone());
-        self.id_to_idx.insert(boxed, idx);
+        self.names.push(id);
+        self.id_to_idx.insert(id, idx);
         idx
     }
 
@@ -327,20 +337,22 @@ impl Dsu {
         }
     }
 
-    fn finalize(mut self) -> FxHashMap<Box<[u8]>, Box<[u8]>> {
+    fn finalize(mut self) -> FxHashMap<&'static [u8], &'static [u8]> {
         let n = self.parent.len();
         let mut canon = FxHashMap::with_capacity_and_hasher(n, Default::default());
         for i in 0..n {
             let r = self.find(i as u32) as usize;
             if i != r {
-                canon.insert(self.names[i].clone(), self.names[r].clone());
+                canon.insert(self.names[i], self.names[r]);
             }
         }
         canon
     }
 }
 
+#[repr(C)]
 struct RawEvent {
+    eid_hash: u128,
     ingest_ts: i64,
     ts: i64,
     event_id: &'static [u8],
@@ -363,6 +375,15 @@ struct CleanClick {
     click_id: &'static [u8],
 }
 
+#[repr(C)]
+struct RawClick {
+    cid_hash: u128,
+    ts: i64,
+    click_id: &'static [u8],
+    user_id: &'static [u8],
+    campaign_idx: u16,
+}
+
 #[derive(Default, Clone)]
 struct CampaignDayAgg {
     sessions: i64,
@@ -371,6 +392,7 @@ struct CampaignDayAgg {
     assisted_sessions: i64,
 }
 
+#[derive(Clone)]
 struct UserDayRow {
     user_id: Box<[u8]>,
     day: i32,
@@ -381,6 +403,8 @@ struct UserDayRow {
 }
 
 fn main() {
+    let t_start = std::time::Instant::now();
+    let mut t = std::time::Instant::now();
     let data_dir = PathBuf::from(env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out_dir = PathBuf::from(env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     if let Ok(ncpu) = env::var("NCPU").and_then(|s| s.parse::<usize>().map_err(|_| env::VarError::NotPresent)) {
@@ -430,17 +454,28 @@ fn main() {
     // 4. Links -> canonical user_id map
     let mut dsu = Dsu::new();
     for path in list_csvs(&data_dir.join("links")) {
-        for_each_data_line(&path, |line| {
-            if let Some([a, b]) = parse_csv_line::<2>(line) {
-                if !a.is_empty() && !b.is_empty() {
-                    let ia = dsu.get_or_insert(a);
-                    let ib = dsu.get_or_insert(b);
-                    dsu.union(ia, ib);
+        if let Some(data) = mmap_data(&path) {
+            let mut pos = match memchr(b'\n', data) {
+                Some(i) => i + 1,
+                None => continue,
+            };
+            while pos < data.len() {
+                let rel = memchr(b'\n', &data[pos..]).unwrap_or(data.len() - pos);
+                let line = &data[pos..pos + rel];
+                pos += rel + 1;
+                if let Some([a, b]) = parse_csv_line::<2>(line) {
+                    if !a.is_empty() && !b.is_empty() {
+                        let ia = dsu.get_or_insert(a);
+                        let ib = dsu.get_or_insert(b);
+                        dsu.union(ia, ib);
+                    }
                 }
             }
-        });
+        }
     }
     let canon_map = dsu.finalize();
+    eprintln!("links: {:?} cumulative: {:?}", t.elapsed(), t_start.elapsed());
+    t = std::time::Instant::now();
 
     // 5. Events: parallel parse & local shard, then parallel dedup
     let event_morsels: Vec<&'static [u8]> = list_csvs(&data_dir.join("events"))
@@ -451,8 +486,12 @@ fn main() {
     let event_shards: Vec<Vec<(u128, RawEvent)>> = event_morsels
         .par_iter()
         .fold(
-            || (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(),
+            Vec::new,
             |mut acc, &morsel| {
+                if acc.is_empty() {
+                    let cap = morsel.len() / (NUM_SHARDS * 70).max(1);
+                    acc = (0..NUM_SHARDS).map(|_| Vec::with_capacity(cap)).collect();
+                }
                 let mut pos = 0;
                 while pos < morsel.len() {
                     let rel = memchr(b'\n', &morsel[pos..]).unwrap_or(morsel.len() - pos);
@@ -464,7 +503,11 @@ fn main() {
                     if eid.is_empty() {
                         continue;
                     }
-                    let Some(ingest_ts) = parse_ts(ing_b) else {
+                    let ingest_ts = if ing_b.len() == 20 && ing_b[19] == b'Z' {
+                        parse_f1_unchecked(ing_b)
+                    } else if let Some(v) = parse_ts(ing_b) {
+                        v
+                    } else {
                         continue;
                     };
                     let mut flags = 0u8;
@@ -502,6 +545,7 @@ fn main() {
                     acc[shard].push((
                         key,
                         RawEvent {
+                            eid_hash: key,
                             ingest_ts,
                             ts,
                             event_id: eid,
@@ -525,42 +569,52 @@ fn main() {
             },
         );
 
+    eprintln!("events_parse: {:?} cumulative: {:?}", t.elapsed(), t_start.elapsed());
+    t = std::time::Instant::now();
+
     // Dedup events per shard & repartition by canonical person
     let person_event_shards: Vec<Vec<(Box<[u8]>, CleanEvent)>> = event_shards
         .into_par_iter()
         .map(|shard_vec| {
-            let mut dedup: FxHashMap<u128, Vec<RawEvent>> =
-                FxHashMap::with_capacity_and_hasher(shard_vec.len(), Default::default());
-            for (key, ev) in shard_vec {
-                let bucket = dedup.entry(key).or_default();
-                if let Some(existing) = bucket.iter_mut().find(|old| old.event_id == ev.event_id) {
-                    if ev.ingest_ts < existing.ingest_ts {
-                        *existing = ev;
-                    }
-                } else {
-                    bucket.push(ev);
+            let mut shard_vec = shard_vec;
+            shard_vec.sort_unstable_by(|a, b| {
+                a.1.eid_hash.cmp(&b.1.eid_hash)
+                    .then_with(|| a.1.event_id.cmp(b.1.event_id))
+                    .then_with(|| a.1.ingest_ts.cmp(&b.1.ingest_ts))
+            });
+            let mut out = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(shard_vec.len() / NUM_SHARDS))
+                .collect::<Vec<_>>();
+            let mut i = 0usize;
+            while i < shard_vec.len() {
+                let hash = shard_vec[i].1.eid_hash;
+                let eid = shard_vec[i].1.event_id;
+                let mut j = i + 1;
+                while j < shard_vec.len()
+                    && shard_vec[j].1.eid_hash == hash
+                    && shard_vec[j].1.event_id == eid
+                {
+                    j += 1;
                 }
-            }
-            let mut out = (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>();
-            for bucket in dedup.into_values() {
-                for ev in bucket {
-                    if ev.flags & 1 != 0 {
-                        let person: Box<[u8]> = canon_map
-                            .get(ev.user_id)
-                            .cloned()
-                            .unwrap_or_else(|| ev.user_id.into());
-                        let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
-                        out[s].push((
-                            person,
-                            CleanEvent {
-                                ts: ev.ts,
-                                price_cents: ev.price_cents,
-                                category_id: ev.category_id,
-                                flags: ev.flags,
-                            },
-                        ));
-                    }
+                let ev = &shard_vec[i].1;
+                if ev.flags & 1 != 0 {
+                    let person: Box<[u8]> = canon_map
+                        .get(ev.user_id)
+                        .cloned()
+                        .map(|p| p.into())
+                        .unwrap_or_else(|| ev.user_id.into());
+                    let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
+                    out[s].push((
+                        person,
+                        CleanEvent {
+                            ts: ev.ts,
+                            price_cents: ev.price_cents,
+                            category_id: ev.category_id,
+                            flags: ev.flags,
+                        },
+                    ));
                 }
+                i = j;
             }
             out
         })
@@ -574,17 +628,24 @@ fn main() {
             },
         );
 
+    eprintln!("events_dedup: {:?} cumulative: {:?}", t.elapsed(), t_start.elapsed());
+    t = std::time::Instant::now();
+
     // 6. Clicks: parallel parse, dedup & repartition by canonical person
     let click_morsels: Vec<&'static [u8]> = list_csvs(&data_dir.join("clicks"))
         .iter()
         .filter_map(|path| mmap_data(path))
         .flat_map(|data| morsels(data).into_iter().map(|(m, _)| m))
         .collect();
-    let click_shards: Vec<Vec<(u128, &'static [u8], &'static [u8], i64, u16)>> = click_morsels
+    let click_shards: Vec<Vec<RawClick>> = click_morsels
         .par_iter()
         .fold(
-            || (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(),
+            Vec::new,
             |mut acc, &morsel| {
+                if acc.is_empty() {
+                    let cap = morsel.len() / (NUM_SHARDS * 70).max(1);
+                    acc = (0..NUM_SHARDS).map(|_| Vec::with_capacity(cap)).collect();
+                }
                 let mut pos = 0;
                 while pos < morsel.len() {
                     let rel = memchr(b'\n', &morsel[pos..]).unwrap_or(morsel.len() - pos);
@@ -607,7 +668,13 @@ fn main() {
                     }
                     let key = fast_hash(cid);
                     let s = (key as usize) & (NUM_SHARDS - 1);
-                    acc[s].push((key, cid, uid, ts, camp_idx));
+                    acc[s].push(RawClick {
+                        cid_hash: key,
+                        ts,
+                        click_id: cid,
+                        user_id: uid,
+                        campaign_idx: camp_idx,
+                    });
                 }
                 acc
             },
@@ -625,28 +692,41 @@ fn main() {
     let person_click_shards: Vec<Vec<(Box<[u8]>, CleanClick)>> = click_shards
         .into_par_iter()
         .map(|shard_vec| {
-            let mut dedup: FxHashMap<u128, Vec<(&'static [u8], &'static [u8], i64, u16)>> =
-                FxHashMap::with_capacity_and_hasher(shard_vec.len(), Default::default());
-            for (key, cid, uid, ts, camp_idx) in shard_vec {
-                let bucket = dedup.entry(key).or_default();
-                if !bucket.iter().any(|(old_cid, _, _, _)| *old_cid == cid) {
-                    bucket.push((cid, uid, ts, camp_idx));
+            let mut shard_vec = shard_vec;
+            shard_vec.sort_unstable_by(|a, b| {
+                a.cid_hash.cmp(&b.cid_hash)
+                    .then_with(|| a.click_id.cmp(b.click_id))
+            });
+            let mut out = (0..NUM_SHARDS)
+                .map(|_| Vec::with_capacity(shard_vec.len() / NUM_SHARDS))
+                .collect::<Vec<_>>();
+            let mut i = 0usize;
+            while i < shard_vec.len() {
+                let hash = shard_vec[i].cid_hash;
+                let cid = shard_vec[i].click_id;
+                let mut j = i + 1;
+                while j < shard_vec.len()
+                    && shard_vec[j].cid_hash == hash
+                    && shard_vec[j].click_id == cid
+                {
+                    j += 1;
                 }
-            }
-            let mut out = (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>();
-            for bucket in dedup.into_values() {
-                for (cid, uid, ts, camp_idx) in bucket {
-                    let person: Box<[u8]> = canon_map.get(uid).cloned().unwrap_or_else(|| uid.into());
-                    let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
-                    out[s].push((
-                        person,
-                        CleanClick {
-                            ts,
-                            campaign_idx: camp_idx,
-                            click_id: cid,
-                        },
-                    ));
-                }
+                let cl = &shard_vec[i];
+                let person: Box<[u8]> = canon_map
+                    .get(cl.user_id)
+                    .cloned()
+                    .map(|p| p.into())
+                    .unwrap_or_else(|| cl.user_id.into());
+                let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
+                out[s].push((
+                    person,
+                    CleanClick {
+                        ts: cl.ts,
+                        campaign_idx: cl.campaign_idx,
+                        click_id: cl.click_id,
+                    },
+                ));
+                i = j;
             }
             out
         })
@@ -660,11 +740,17 @@ fn main() {
             },
         );
 
+    eprintln!("clicks: {:?} cumulative: {:?}", t.elapsed(), t_start.elapsed());
+    t = std::time::Instant::now();
+
     // 7. Sessionize, attribute, and aggregate per person shard in parallel
     let num_cats = cat_names.len();
     let num_camps = camp_names.len();
 
-    let shard_results: Vec<(Vec<UserDayRow>, FxHashMap<(u16, i32), CampaignDayAgg>)> =
+    let start_day = window_start.div_euclid(MS_PER_DAY) as i32;
+    let end_day = (window_end - 1).div_euclid(MS_PER_DAY) as i32;
+    let num_days = (end_day - start_day + 1).max(1) as usize;
+    let shard_results: Vec<(Vec<UserDayRow>, Vec<CampaignDayAgg>)> =
         person_event_shards
             .into_par_iter()
             .zip(person_click_shards.into_par_iter())
@@ -679,7 +765,8 @@ fn main() {
                 }
 
                 let mut user_rows = Vec::new();
-                let mut camp_agg: FxHashMap<(u16, i32), CampaignDayAgg> = FxHashMap::default();
+                let mut camp_agg: Vec<CampaignDayAgg> =
+                    (0..num_camps * num_days).map(|_| CampaignDayAgg::default()).collect();
                 let mut assist_stamp = vec![0u32; num_camps];
                 let mut cur_stamp: u32 = 0;
 
@@ -755,7 +842,7 @@ fn main() {
                                 best_idx -= 1;
                             }
                             let cred_camp = clicks[best_idx].campaign_idx;
-                            let entry = camp_agg.entry((cred_camp, day)).or_default();
+                            let entry = &mut camp_agg[(cred_camp as usize) * num_days + (day - start_day) as usize];
                             entry.sessions += 1;
                             if sess_has_purchase {
                                 entry.purchasing_sessions += 1;
@@ -772,12 +859,13 @@ fn main() {
                                 let c = cl.campaign_idx as usize;
                                 if assist_stamp[c] != cur_stamp {
                                     assist_stamp[c] = cur_stamp;
-                                    camp_agg.entry((cl.campaign_idx, day)).or_default().assisted_sessions += 1;
+                                    let idx = (cl.campaign_idx as usize) * num_days + (day - start_day) as usize;
+                                    camp_agg[idx].assisted_sessions += 1;
                                 }
                             }
                         } else {
                             // Organic (campaign_idx = 0)
-                            let entry = camp_agg.entry((0, day)).or_default();
+                            let entry = &mut camp_agg[(day - start_day) as usize];
                             entry.sessions += 1;
                             if sess_has_purchase {
                                 entry.purchasing_sessions += 1;
@@ -823,27 +911,34 @@ fn main() {
     shard_results
         .par_iter()
         .enumerate()
-        .for_each(|(shard, (rows, _))| {
-            write_user_daily_shard(
-                &out_dir.join("user_daily"),
-                shard,
-                rows,
-                &cat_names,
-            );
+        .chunks(8)
+        .enumerate()
+        .for_each(|(part, batch)| {
+            let mut rows = Vec::new();
+            for (_, (shard_rows, _)) in batch {
+                rows.extend_from_slice(shard_rows);
+            }
+            write_user_daily_shard(&out_dir.join("user_daily"), part, &rows, &cat_names);
         });
 
     let mut final_camp: FxHashMap<(u16, i32), CampaignDayAgg> = FxHashMap::default();
     for (_, ca) in shard_results {
-        for (k, v) in ca {
-            let e = final_camp.entry(k).or_default();
-            e.sessions += v.sessions;
-            e.purchasing_sessions += v.purchasing_sessions;
-            e.revenue_cents += v.revenue_cents;
-            e.assisted_sessions += v.assisted_sessions;
+        for (idx, v) in ca.into_iter().enumerate() {
+            if v.sessions != 0 || v.assisted_sessions != 0 {
+                let cidx = idx / num_days;
+                let day = start_day + (idx % num_days) as i32;
+                let e = final_camp.entry((cidx as u16, day)).or_default();
+                e.sessions += v.sessions;
+                e.purchasing_sessions += v.purchasing_sessions;
+                e.revenue_cents += v.revenue_cents;
+                e.assisted_sessions += v.assisted_sessions;
+            }
         }
     }
 
     write_campaign_daily(&out_dir.join("campaign_daily"), &final_camp, &camp_names, &camp_channels);
+    eprintln!("sessionize_write: {:?} cumulative: {:?}", t.elapsed(), t_start.elapsed());
+    eprintln!("total: {:?}", t_start.elapsed());
     std::process::exit(0);
 }
 
