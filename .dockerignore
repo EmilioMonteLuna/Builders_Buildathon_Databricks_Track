@@ -1,0 +1,7 @@
+target/
+dev/
+out/
+dev-answer/
+fixtures/
+scripts/
+.git/
