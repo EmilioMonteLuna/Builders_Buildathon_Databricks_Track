@@ -1,22 +1,16 @@
-use arrow::array::{Date32Builder, Int64Builder, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use memchr::memchr;
+use memchr::{memchr, memchr2_iter};
 use memmap2::Mmap;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use std::env;
 use std::fs::{self, File};
-use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use mimalloc::MiMalloc;
 use std::sync::Mutex;
+
+mod parquet_writer;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -96,10 +90,6 @@ impl DateCache {
         if entry.0 == key { Some(entry.1) } else { None }
     }
 
-    fn get(&self, b: &[u8]) -> Option<i64> {
-        if b.len() < 10 { return None; }
-        self.get_with_day(b, parse_2d(&b[8..10])?)
-    }
 }
 
 #[inline]
@@ -170,10 +160,16 @@ fn pack_fast_id(b: &[u8], lo_prefix: u8, hi_prefix: u8) -> Option<u64> {
     }
     let mut packed = if lower { 1u64 << 62 } else { 0 };
     let table = if lower { &BASE36_LOWER } else { &BASE36_UPPER };
-    for (i, &c) in b[1..].iter().enumerate() {
-        let value = table[c as usize];
-        if value == 0 { return None; }
-        packed |= (value as u64) << (54 - i * 6);
+    unsafe {
+        let bytes = b.as_ptr();
+        let lookup = table.as_ptr();
+        for i in 1..b.len() {
+            let value = *lookup.add(*bytes.add(i) as usize);
+            if value == 0 {
+                return None;
+            }
+            packed |= (value as u64) << (54 - (i - 1) * 6);
+        }
     }
     Some(packed)
 }
@@ -225,10 +221,6 @@ impl IdPool {
 
     fn fallback_snapshot(&self) -> Vec<Box<[u8]>> {
         self.fallback.lock().expect("fallback ID pool").0.clone()
-    }
-
-    fn has_fallback(&self) -> bool {
-        !self.fallback.lock().expect("fallback ID pool").0.is_empty()
     }
 
     fn cmp_user(&self, a: u64, b: u64) -> std::cmp::Ordering {
@@ -346,13 +338,31 @@ where
     if start == end {
         return;
     }
-    if has_quote {
-        if let Some(fields) = parse_csv_line_fast::<N>(&data[start..end]) {
-            callback(fields);
-        }
+    if comma_count != N.saturating_sub(1) {
         return;
     }
-    if comma_count != N.saturating_sub(1) {
+
+    if has_quote {
+        let mut fields = [&[][..]; N];
+        let mut field_start = start;
+        for field in 0..N {
+            let field_end = if field + 1 == N { end } else { commas[field] };
+            let mut value = &data[field_start..field_end];
+            if value.first() == Some(&b'"') {
+                if value.len() < 2 || value.last() != Some(&b'"') {
+                    return;
+                }
+                value = &value[1..value.len() - 1];
+                if memchr(b'"', value).is_some() {
+                    return;
+                }
+            } else if memchr(b'"', value).is_some() {
+                return;
+            }
+            fields[field] = value;
+            field_start = field_end + 1;
+        }
+        callback(fields);
         return;
     }
 
@@ -389,32 +399,25 @@ where
     let mut commas = [0usize; N];
     let mut comma_count = 0usize;
     let mut comma_overflow = false;
-    let mut has_quote = false;
-    for (pos, &byte) in data.iter().enumerate() {
-        match byte {
-            b',' => {
-                if comma_count < N {
-                    commas[comma_count] = pos;
-                    comma_count += 1;
-                } else {
-                    comma_overflow = true;
-                }
+    for pos in memchr2_iter(b'\n', b',', data) {
+        if data[pos] == b',' {
+            if comma_count < N {
+                commas[comma_count] = pos;
+                comma_count += 1;
+            } else {
+                comma_overflow = true;
             }
-            b'"' => has_quote = true,
-            b'\n' => {
-                if !comma_overflow {
-                    finish_csv_line::<N, F>(data, line_start, pos, &commas, comma_count, has_quote, callback);
-                }
-                line_start = pos + 1;
-                comma_count = 0;
-                comma_overflow = false;
-                has_quote = false;
+        } else {
+            if !comma_overflow {
+                finish_csv_line::<N, F>(data, line_start, pos, &commas, comma_count, true, callback);
             }
-            _ => {}
+            line_start = pos + 1;
+            comma_count = 0;
+            comma_overflow = false;
         }
     }
     if !comma_overflow {
-        finish_csv_line::<N, F>(data, line_start, data.len(), &commas, comma_count, has_quote, callback);
+        finish_csv_line::<N, F>(data, line_start, data.len(), &commas, comma_count, true, callback);
     }
 }
 
@@ -440,12 +443,14 @@ where
         let mut newline_mask = _mm512_cmpeq_epi8_mask(block, newline);
         let mut comma_mask = _mm512_cmpeq_epi8_mask(block, comma);
         let mut quote_mask = _mm512_cmpeq_epi8_mask(block, quote);
-        let mut mask = newline_mask | comma_mask | quote_mask;
+        let mut mask = newline_mask | comma_mask;
         while mask != 0 {
             let bit = mask.trailing_zeros() as usize;
             let pos = block_start + bit;
             let bit_mask = 1u64 << bit;
             if newline_mask & bit_mask != 0 {
+                let through_line = if bit == 0 { 0 } else { (1u64 << bit) - 1 };
+                has_quote |= quote_mask & through_line != 0;
                 if !comma_overflow {
                     finish_csv_line::<N, F>(data, line_start, pos, &commas, comma_count, has_quote, callback);
                 }
@@ -453,6 +458,8 @@ where
                 comma_count = 0;
                 comma_overflow = false;
                 has_quote = false;
+                let through_newline = if bit == 63 { u64::MAX } else { (1u64 << (bit + 1)) - 1 };
+                quote_mask &= !through_newline;
                 newline_mask &= !bit_mask;
             } else if comma_mask & bit_mask != 0 {
                 if comma_count < N {
@@ -462,16 +469,15 @@ where
                     comma_overflow = true;
                 }
                 comma_mask &= !bit_mask;
-            } else {
-                has_quote = true;
-                quote_mask &= !bit_mask;
             }
             mask &= mask - 1;
         }
+        has_quote |= quote_mask != 0;
         block_start += 64;
     }
     for pos in block_start..data.len() {
         match data[pos] {
+            b'"' => has_quote = true,
             b',' => {
                 if comma_count < N {
                     commas[comma_count] = pos;
@@ -480,7 +486,6 @@ where
                     comma_overflow = true;
                 }
             }
-            b'"' => has_quote = true,
             b'\n' => {
                 if !comma_overflow {
                     finish_csv_line::<N, F>(data, line_start, pos, &commas, comma_count, has_quote, callback);
@@ -525,6 +530,16 @@ fn parse_2d(b: &[u8]) -> Option<u32> {
 }
 
 #[inline]
+unsafe fn parse_2d_at_unchecked(b: &[u8], offset: usize) -> Option<u32> {
+    let d0 = (*b.get_unchecked(offset)).wrapping_sub(b'0');
+    let d1 = (*b.get_unchecked(offset + 1)).wrapping_sub(b'0');
+    if d0 > 9 || d1 > 9 {
+        return None;
+    }
+    Some(d0 as u32 * 10 + d1 as u32)
+}
+
+#[inline]
 fn parse_4d(b: &[u8]) -> Option<i64> {
     let hi = parse_2d(&b[0..2])? as i64;
     let lo = parse_2d(&b[2..4])? as i64;
@@ -561,16 +576,29 @@ fn parse_iso_base(b: &[u8]) -> Option<i64> {
 
 #[inline]
 fn parse_iso_base_cached(b: &[u8], cache: &DateCache) -> Option<i64> {
-    if b.len() < 19
-        || b[4] != b'-' || b[7] != b'-' || b[10] != b'T'
-        || b[13] != b':' || b[16] != b':'
-    {
+    if b.len() < 19 {
         return None;
     }
-    let d = parse_2d(&b[8..10])?;
-    let hh = parse_2d(&b[11..13])?;
-    let mm = parse_2d(&b[14..16])?;
-    let ss = parse_2d(&b[17..19])?;
+    let (year_dash, month_dash, t, hour_colon, minute_colon) = unsafe {
+        (
+            *b.get_unchecked(4),
+            *b.get_unchecked(7),
+            *b.get_unchecked(10),
+            *b.get_unchecked(13),
+            *b.get_unchecked(16),
+        )
+    };
+    if year_dash != b'-' || month_dash != b'-' || t != b'T' || hour_colon != b':' || minute_colon != b':' {
+        return None;
+    }
+    let (d, hh, mm, ss) = unsafe {
+        (
+            parse_2d_at_unchecked(b, 8)?,
+            parse_2d_at_unchecked(b, 11)?,
+            parse_2d_at_unchecked(b, 14)?,
+            parse_2d_at_unchecked(b, 17)?,
+        )
+    };
     if hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
@@ -582,16 +610,34 @@ fn parse_iso_base_cached(b: &[u8], cache: &DateCache) -> Option<i64> {
 
 #[inline]
 fn parse_f1_ingest(b: &[u8], cache: &DateCache) -> Option<i64> {
-    if b.len() != 20 || b[19] != b'Z'
-        || b[4] != b'-' || b[7] != b'-' || b[10] != b'T'
-        || b[13] != b':' || b[16] != b':' {
+    if b.len() != 20 {
         return None;
     }
-    if let Some(day_ms) = cache.get(b) {
-        let hh = parse_2d(&b[11..13])?;
-        let mm = parse_2d(&b[14..16])?;
-        let ss = parse_2d(&b[17..19])?;
-        if hh <= 23 && mm <= 59 && ss <= 59 {
+    let (z, year_dash, month_dash, t, hour_colon, minute_colon) = unsafe {
+        (
+            *b.get_unchecked(19),
+            *b.get_unchecked(4),
+            *b.get_unchecked(7),
+            *b.get_unchecked(10),
+            *b.get_unchecked(13),
+            *b.get_unchecked(16),
+        )
+    };
+    if z != b'Z' || year_dash != b'-' || month_dash != b'-' || t != b'T'
+        || hour_colon != b':' || minute_colon != b':'
+    {
+        return None;
+    }
+    let (d, hh, mm, ss) = unsafe {
+        (
+            parse_2d_at_unchecked(b, 8)?,
+            parse_2d_at_unchecked(b, 11)?,
+            parse_2d_at_unchecked(b, 14)?,
+            parse_2d_at_unchecked(b, 17)?,
+        )
+    };
+    if hh <= 23 && mm <= 59 && ss <= 59 {
+        if let Some(day_ms) = cache.get_with_day(b, d) {
             return Some(day_ms + (hh as i64 * 3600 + mm as i64 * 60 + ss as i64) * 1000);
         }
     }
@@ -642,19 +688,23 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
 #[inline]
 fn parse_ts_cached(b: &[u8], cache: &DateCache) -> Option<i64> {
     if b.len() == 13 {
-        let d0 = b[0].wrapping_sub(b'0');
-        let d1 = b[1].wrapping_sub(b'0');
-        let d2 = b[2].wrapping_sub(b'0');
-        let d3 = b[3].wrapping_sub(b'0');
-        let d4 = b[4].wrapping_sub(b'0');
-        let d5 = b[5].wrapping_sub(b'0');
-        let d6 = b[6].wrapping_sub(b'0');
-        let d7 = b[7].wrapping_sub(b'0');
-        let d8 = b[8].wrapping_sub(b'0');
-        let d9 = b[9].wrapping_sub(b'0');
-        let d10 = b[10].wrapping_sub(b'0');
-        let d11 = b[11].wrapping_sub(b'0');
-        let d12 = b[12].wrapping_sub(b'0');
+        let (d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12) = unsafe {
+            (
+                (*b.get_unchecked(0)).wrapping_sub(b'0'),
+                (*b.get_unchecked(1)).wrapping_sub(b'0'),
+                (*b.get_unchecked(2)).wrapping_sub(b'0'),
+                (*b.get_unchecked(3)).wrapping_sub(b'0'),
+                (*b.get_unchecked(4)).wrapping_sub(b'0'),
+                (*b.get_unchecked(5)).wrapping_sub(b'0'),
+                (*b.get_unchecked(6)).wrapping_sub(b'0'),
+                (*b.get_unchecked(7)).wrapping_sub(b'0'),
+                (*b.get_unchecked(8)).wrapping_sub(b'0'),
+                (*b.get_unchecked(9)).wrapping_sub(b'0'),
+                (*b.get_unchecked(10)).wrapping_sub(b'0'),
+                (*b.get_unchecked(11)).wrapping_sub(b'0'),
+                (*b.get_unchecked(12)).wrapping_sub(b'0'),
+            )
+        };
         if (d0 | d1 | d2 | d3 | d4 | d5 | d6 | d7 | d8 | d9 | d10 | d11 | d12) <= 9 {
             return Some(
                 d0 as i64 * 1_000_000_000_000
@@ -870,7 +920,7 @@ fn for_each_data_line<F: FnMut(&[u8])>(path: &Path, mut f: F) {
         let _ = libc::madvise(
             mmap.as_ptr() as *mut libc::c_void,
             mmap.len(),
-            libc::MADV_SEQUENTIAL | libc::MADV_WILLNEED,
+            libc::MADV_SEQUENTIAL,
         );
     }
     let mmap = Box::leak(Box::new(mmap));
@@ -894,147 +944,50 @@ fn for_each_data_line<F: FnMut(&[u8])>(path: &Path, mut f: F) {
     }
 }
 
-const FILE_CHUNK_BYTES: usize = 2 * 1024 * 1024;
-
-#[derive(Clone)]
-struct FileChunk {
-    path: PathBuf,
-    start: u64,
-    end: u64,
-    content_start: u64,
-    file_len: u64,
-}
-
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn mmap_data(path: &Path) -> Option<&'static [u8]> {
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() == 0 {
+        return None;
+    }
+    let mmap = unsafe { Mmap::map(&file).expect("mmap input CSV") };
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_at(buf, offset)
+    unsafe {
+        let _ = libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_SEQUENTIAL,
+        );
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        file.seek_read(buf, offset)
-    }
+    let mmap = Box::leak(Box::new(mmap));
+    Some(&mmap[..])
 }
 
-fn fill_at(
-    file: &File,
-    buffer: &mut Vec<u8>,
-    file_start: u64,
-    target_len: usize,
-    file_len: u64,
-) -> io::Result<()> {
-    let target = target_len.min(file_len.saturating_sub(file_start) as usize);
-    while buffer.len() < target {
-        let start = buffer.len();
-        let end = (start + 256 * 1024).min(target);
-        buffer.resize(end, 0);
-        let mut read = 0usize;
-        while read < end - start {
-            let n = read_at(file, &mut buffer[start + read..end], file_start + (start + read) as u64)?;
-            if n == 0 {
-                buffer.truncate(start + read);
-                return Ok(());
-            }
-            read += n;
-        }
-    }
-    Ok(())
-}
-
-fn read_header_end(file: &File, file_len: u64) -> io::Result<Option<u64>> {
-    let mut offset = 0u64;
-    let mut buffer = [0u8; 4096];
-    while offset < file_len {
-        let len = (file_len - offset).min(buffer.len() as u64) as usize;
-        let n = read_at(file, &mut buffer[..len], offset)?;
-        if n == 0 {
-            break;
-        }
-        if let Some(pos) = memchr(b'\n', &buffer[..n]) {
-            return Ok(Some(offset + pos as u64 + 1));
-        }
-        offset += n as u64;
-    }
-    Ok(None)
-}
-
-fn read_chunks(dir: &Path) -> Vec<FileChunk> {
-    let mut chunks = Vec::new();
-    for path in list_csvs(dir) {
-        let file = File::open(&path).expect("open input CSV");
-        let file_len = file.metadata().expect("stat input CSV").len();
-        let Some(content_start) = read_header_end(&file, file_len).expect("read CSV header") else {
-            continue;
+fn mmap_morsels(data: &'static [u8]) -> Vec<&'static [u8]> {
+    const MORSEL_BYTES: usize = 4 * 1024 * 1024;
+    let mut morsels = Vec::new();
+    let mut start = match memchr(b'\n', data) {
+        Some(header_end) => header_end + 1,
+        None => return morsels,
+    };
+    while start < data.len() {
+        let target = start.saturating_add(MORSEL_BYTES);
+        let end = if target >= data.len() {
+            data.len()
+        } else {
+            target + memchr(b'\n', &data[target..]).map_or(data.len() - target, |p| p + 1)
         };
-        let mut start = content_start;
-        while start < file_len {
-            let end = (start + FILE_CHUNK_BYTES as u64).min(file_len);
-            chunks.push(FileChunk {
-                path: path.clone(),
-                start,
-                end,
-                content_start,
-                file_len,
-            });
-            start = end;
-        }
+        morsels.push(&data[start..end]);
+        start = end;
     }
-    chunks
+    morsels
 }
 
-fn read_file_chunk(chunk: &FileChunk, buffer: &mut Vec<u8>) -> io::Result<(usize, usize)> {
-    let file = File::open(&chunk.path)?;
-    let nominal_len = (chunk.end - chunk.start) as usize;
-    buffer.clear();
-    fill_at(&file, buffer, chunk.start, nominal_len, chunk.file_len)?;
-
-    let mut line_start = 0usize;
-    if chunk.start > chunk.content_start {
-        let mut previous = [0u8; 1];
-        read_at(&file, &mut previous, chunk.start - 1)?;
-        if previous[0] != b'\n' {
-            let mut search_from = 0usize;
-            loop {
-                if let Some(relative) = memchr(b'\n', &buffer[search_from..]) {
-                    line_start = search_from + relative + 1;
-                    break;
-                }
-                search_from = buffer.len();
-                if chunk.start + buffer.len() as u64 >= chunk.file_len {
-                    return Ok((0, 0));
-                }
-                fill_at(
-                    &file,
-                    buffer,
-                    chunk.start,
-                    buffer.len().saturating_add(64 * 1024),
-                    chunk.file_len,
-                )?;
-            }
-        }
-    }
-    if line_start >= nominal_len {
-        return Ok((0, 0));
-    }
-
-    let search_from = nominal_len.saturating_sub(1);
-    loop {
-        if let Some(relative) = memchr(b'\n', &buffer[search_from.min(buffer.len())..]) {
-            return Ok((line_start, (search_from.min(buffer.len()) + relative + 1).min(buffer.len())));
-        }
-        if chunk.start + buffer.len() as u64 >= chunk.file_len {
-            return Ok((line_start, buffer.len()));
-        }
-        fill_at(
-            &file,
-            buffer,
-            chunk.start,
-            buffer.len().saturating_add(64 * 1024),
-            chunk.file_len,
-        )?;
-    }
+fn mmap_csv_morsels(dir: &Path) -> Vec<&'static [u8]> {
+    list_csvs(dir)
+        .iter()
+        .filter_map(|path| mmap_data(path))
+        .flat_map(mmap_morsels)
+        .collect()
 }
 
 // Union-Find tracking byte-wise smallest user_id per component
@@ -1164,7 +1117,7 @@ impl CanonicalMap {
     #[inline]
     fn bloom_contains(&self, hash: u64) -> bool {
         let bit = hash as usize & ((1usize << 24) - 1);
-        self.bloom[bit >> 6] & (1u64 << (bit & 63)) != 0
+        unsafe { *self.bloom.get_unchecked(bit >> 6) & (1u64 << (bit & 63)) != 0 }
     }
 
     #[inline]
@@ -1179,7 +1132,7 @@ impl CanonicalMap {
         }
         let mut slot = self.initial_slot(hash);
         loop {
-            let (found, value) = self.entries[slot];
+            let (found, value) = unsafe { *self.entries.get_unchecked(slot) };
             if found == 0 {
                 return key;
             }
@@ -1192,33 +1145,7 @@ impl CanonicalMap {
 
 }
 
-fn build_canon_map_from_chunks(
-    link_chunks: &[FileChunk],
-    ids: &IdPool,
-    worker_count: usize,
-) -> CanonicalMap {
-    let next_chunk = AtomicUsize::new(0);
-    let pairs_by_worker = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            handles.push(scope.spawn(|| {
-                let mut pairs = Vec::new();
-                let mut buffer = Vec::with_capacity(FILE_CHUNK_BYTES);
-                loop {
-                    let chunk_index = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = link_chunks.get(chunk_index) else { break };
-                    let (start, end) = read_file_chunk(chunk, &mut buffer).expect("read links chunk");
-                    scan_csv_morsel::<2, _>(&buffer[start..end], |[a, b]| {
-                        if !a.is_empty() && !b.is_empty() {
-                            pairs.push((ids.key(a, b'u', b'U'), ids.key(b, b'u', b'U')));
-                        }
-                    });
-                }
-                pairs
-            }));
-        }
-        handles.into_iter().map(|h| h.join().expect("link parser")).collect::<Vec<_>>()
-    });
+fn build_canon_map(pairs_by_worker: Vec<Vec<(u64, u64)>>, ids: &IdPool) -> CanonicalMap {
     let total_pairs = pairs_by_worker.iter().map(Vec::len).sum();
     let mut dsu = Dsu::new(total_pairs);
     for pairs in pairs_by_worker {
@@ -1285,61 +1212,6 @@ impl EventStaging {
             }
         }
     }
-}
-
-fn parse_event_chunks(
-    chunks: &[FileChunk],
-    worker_count: usize,
-    window_start: i64,
-    window_end: i64,
-    prod_fast: &[u16],
-    prod_fallback: &FxHashMap<Box<[u8]>, u16>,
-    ids: &IdPool,
-    date_cache: DateCache,
-) -> Vec<EventWorkerBuckets> {
-    let event_index = AtomicUsize::new(0);
-    let estimated_bytes: usize = chunks.iter().map(|chunk| (chunk.end - chunk.start) as usize).sum();
-    let per_worker_bucket = estimated_bytes / worker_count / DEDUP_SHARDS / 70;
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            handles.push(scope.spawn(|| {
-                let mut buckets = (0..DEDUP_SHARDS)
-                    .map(|_| Vec::with_capacity(per_worker_bucket))
-                    .collect::<Vec<Vec<RawEvent>>>();
-                let mut staging = EventStaging::new();
-                let mut wide_ingest = FxHashMap::default();
-                let mut wide_ts = FxHashMap::default();
-                let mut wide_category = FxHashMap::default();
-                let mut date_cache = date_cache;
-                let mut buffer = Vec::with_capacity(FILE_CHUNK_BYTES);
-                loop {
-                    let chunk_index = event_index.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(chunk_index) else { break };
-                    let (start, end) = read_file_chunk(chunk, &mut buffer).expect("read events chunk");
-                    scan_csv_morsel::<7, _>(&buffer[start..end], |fields| {
-                        parse_event_fields(
-                            fields,
-                            window_start,
-                            window_end,
-                            prod_fast,
-                            prod_fallback,
-                            ids,
-                            &mut date_cache,
-                            &mut buckets,
-                            &mut staging,
-                            &mut wide_ingest,
-                            &mut wide_ts,
-                            &mut wide_category,
-                        );
-                    });
-                }
-                staging.flush(&mut buckets);
-                EventWorkerBuckets { buckets, wide_ingest, wide_ts, wide_category }
-            }));
-        }
-        handles.into_iter().map(|handle| handle.join().expect("event worker")).collect()
-    })
 }
 
 #[inline]
@@ -1480,54 +1352,6 @@ struct ClickWorkerBuckets {
     wide_ts: FxHashMap<u64, i64>,
 }
 
-fn parse_click_chunks(
-    chunks: &[FileChunk],
-    worker_count: usize,
-    click_start: i64,
-    window_end: i64,
-    camp_fast: &[u16],
-    camp_fallback: &FxHashMap<Box<[u8]>, u16>,
-    ids: &IdPool,
-    date_cache: DateCache,
-) -> Vec<ClickWorkerBuckets> {
-    let click_index = AtomicUsize::new(0);
-    let estimated_bytes: usize = chunks.iter().map(|chunk| (chunk.end - chunk.start) as usize).sum();
-    let per_worker_bucket = estimated_bytes / worker_count / DEDUP_SHARDS / 70;
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            handles.push(scope.spawn(|| {
-                let mut buckets = (0..DEDUP_SHARDS)
-                    .map(|_| Vec::with_capacity(per_worker_bucket))
-                    .collect::<Vec<Vec<RawClick>>>();
-                let mut wide_ts = FxHashMap::default();
-                let mut date_cache = date_cache;
-                let mut buffer = Vec::with_capacity(FILE_CHUNK_BYTES);
-                loop {
-                    let chunk_index = click_index.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(chunk_index) else { break };
-                    let (start, end) = read_file_chunk(chunk, &mut buffer).expect("read clicks chunk");
-                    scan_csv_morsel::<4, _>(&buffer[start..end], |fields| {
-                        parse_click_fields(
-                            fields,
-                            click_start,
-                            window_end,
-                            camp_fast,
-                            camp_fallback,
-                            ids,
-                            &mut date_cache,
-                            &mut buckets,
-                            &mut wide_ts,
-                        );
-                    });
-                }
-                ClickWorkerBuckets { buckets, wide_ts }
-            }));
-        }
-        handles.into_iter().map(|handle| handle.join().expect("click worker")).collect()
-    })
-}
-
 #[derive(Clone, Copy, Debug)]
 struct WideClickMeta(i64);
 
@@ -1548,29 +1372,1081 @@ struct CampaignDayAgg {
     assisted_sessions: i64,
 }
 
-#[derive(Clone)]
-struct UserDayRow {
-    user_key: u64,
-    day: i32,
-    sessions: i64,
-    events: i64,
-    revenue_cents: i64,
-    top_category: Option<u16>,
+struct UserDailyBuffers {
+    rows: usize,
+    user_id: Vec<u8>,
+    day: Vec<u8>,
+    sessions: Vec<u8>,
+    events: Vec<u8>,
+    revenue: Vec<u8>,
+    category_def: Vec<u8>,
+    category_values: Vec<u8>,
 }
 
-fn main() {
+impl UserDailyBuffers {
+    fn with_capacity(rows: usize) -> Self {
+        Self {
+            rows: 0,
+            user_id: Vec::with_capacity(rows.saturating_mul(12)),
+            day: Vec::with_capacity(rows.saturating_mul(4)),
+            sessions: Vec::with_capacity(rows.saturating_mul(8)),
+            events: Vec::with_capacity(rows.saturating_mul(8)),
+            revenue: Vec::with_capacity(rows.saturating_mul(8)),
+            category_def: Vec::with_capacity(rows),
+            category_values: Vec::with_capacity(rows.saturating_mul(12)),
+        }
+    }
+
+    fn push(
+        &mut self,
+        user_id: &[u8],
+        day: i32,
+        sessions: i64,
+        events: i64,
+        revenue: i64,
+        category: Option<&[u8]>,
+    ) {
+        append_plain_byte_array(&mut self.user_id, user_id);
+        self.day.extend_from_slice(&day.to_le_bytes());
+        self.sessions.extend_from_slice(&sessions.to_le_bytes());
+        self.events.extend_from_slice(&events.to_le_bytes());
+        self.revenue.extend_from_slice(&revenue.to_le_bytes());
+        if let Some(category) = category {
+            self.category_def.push(1);
+            append_plain_byte_array(&mut self.category_values, category);
+        } else {
+            self.category_def.push(0);
+        }
+        self.rows += 1;
+    }
+
+    fn columns(&self) -> [parquet_writer::Column<'_>; 6] {
+        use parquet_writer::PhysicalType::{ByteArray, Int32, Int64};
+        [
+            parquet_writer::Column {
+                name: "user_id",
+                physical_type: ByteArray,
+                converted_type: Some(0),
+                values: &self.user_id,
+                definition_levels: None,
+            },
+            parquet_writer::Column {
+                name: "day",
+                physical_type: Int32,
+                converted_type: Some(6),
+                values: &self.day,
+                definition_levels: None,
+            },
+            parquet_writer::Column {
+                name: "sessions",
+                physical_type: Int64,
+                converted_type: None,
+                values: &self.sessions,
+                definition_levels: None,
+            },
+            parquet_writer::Column {
+                name: "events",
+                physical_type: Int64,
+                converted_type: None,
+                values: &self.events,
+                definition_levels: None,
+            },
+            parquet_writer::Column {
+                name: "revenue_cents",
+                physical_type: Int64,
+                converted_type: None,
+                values: &self.revenue,
+                definition_levels: None,
+            },
+            parquet_writer::Column {
+                name: "top_category",
+                physical_type: ByteArray,
+                converted_type: Some(0),
+                values: &self.category_values,
+                definition_levels: Some(&self.category_def),
+            },
+        ]
+    }
+}
+
+fn append_plain_byte_array(output: &mut Vec<u8>, value: &[u8]) {
+    let len = u32::try_from(value.len()).expect("Parquet byte array length");
+    output.extend_from_slice(&len.to_le_bytes());
+    output.extend_from_slice(value);
+}
+
+struct ParseWorkerData {
+    events: EventWorkerBuckets,
+    clicks: ClickWorkerBuckets,
+}
+
+struct ParsedData {
+    workers: Vec<ParseWorkerData>,
+    fallback_ids: Vec<Box<[u8]>>,
+    total_event_rows: usize,
+    total_click_rows: usize,
+}
+
+struct DedupWorkerData {
+    events: Vec<Vec<CleanEvent>>,
+    clicks: Vec<Vec<CleanClick>>,
+}
+
+struct DedupData {
+    workers: Vec<DedupWorkerData>,
+    wide_event_meta: Vec<WideEventMeta>,
+    wide_click_meta: Vec<WideClickMeta>,
+    fallback_ids: Vec<Box<[u8]>>,
+    total_event_rows: usize,
+    total_click_rows: usize,
+}
+
+struct CompletionCounter {
+    remaining: AtomicUsize,
+    finished_at: Mutex<Option<std::time::Instant>>,
+}
+
+impl CompletionCounter {
+    fn new(total: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(total),
+            finished_at: Mutex::new(if total == 0 { Some(std::time::Instant::now()) } else { None }),
+        }
+    }
+
+    fn complete_one(&self) {
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self.finished_at.lock().expect("completion time") = Some(std::time::Instant::now());
+        }
+    }
+
+    fn finished_at(&self) -> std::time::Instant {
+        self.finished_at
+            .lock()
+            .expect("completion time")
+            .as_ref()
+            .copied()
+            .unwrap_or_else(std::time::Instant::now)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StageTiming {
+    elapsed: std::time::Duration,
+    cumulative: std::time::Duration,
+}
+
+#[derive(Default)]
+struct PipelineTimings {
+    links: StageTiming,
+    events_parse: StageTiming,
+    events_dedup: StageTiming,
+    clicks: StageTiming,
+    sessionize_write: StageTiming,
+}
+
+fn stage_timing(start: std::time::Instant, finish: std::time::Instant, overall: std::time::Instant) -> StageTiming {
+    StageTiming {
+        elapsed: finish.saturating_duration_since(start),
+        cumulative: finish.saturating_duration_since(overall),
+    }
+}
+
+fn deduplicate_worker(
+    parsed: &ParsedData,
+    canon_map: &CanonicalMap,
+    worker_count: usize,
+    window_start: i64,
+    click_start: i64,
+    event_shard_index: &AtomicUsize,
+    click_shard_index: &AtomicUsize,
+    event_complete: &CompletionCounter,
+    click_complete: &CompletionCounter,
+    event_meta: &Mutex<Vec<WideEventMeta>>,
+    click_meta: &Mutex<Vec<WideClickMeta>>,
+    phase_barrier: &Barrier,
+) -> DedupWorkerData {
+    let mut table = Vec::<DedupSlot>::new();
+    let mut occupied = Vec::<u32>::new();
+    let output_event_capacity = parsed.total_event_rows / worker_count / PERSON_SHARDS + 64;
+    let output_click_capacity = parsed.total_click_rows / worker_count / PERSON_SHARDS + 64;
+    let mut event_outputs = (0..PERSON_SHARDS)
+        .map(|_| Vec::with_capacity(output_event_capacity))
+        .collect::<Vec<Vec<CleanEvent>>>();
+    let mut click_outputs = (0..PERSON_SHARDS)
+        .map(|_| Vec::with_capacity(output_click_capacity))
+        .collect::<Vec<Vec<CleanClick>>>();
+    let mut event_staging = CleanEventStaging::new();
+    let mut click_staging = CleanClickStaging::new();
+    let empty_slot = DedupSlot { key: 0, ingest_sec: 0, loc: u32::MAX };
+
+    loop {
+        let shard = event_shard_index.fetch_add(1, Ordering::Relaxed);
+        if shard >= DEDUP_SHARDS {
+            break;
+        }
+        let total: usize = parsed.workers.iter().map(|producer| producer.events.buckets[shard].len()).sum();
+        let cap = ((total * 3 / 2).next_power_of_two()).max(64);
+        table.resize(cap, empty_slot);
+        let mask = cap - 1;
+        for (worker_index, producer) in parsed.workers.iter().enumerate() {
+            let bucket = &producer.events.buckets[shard];
+            for (group_index, group) in bucket.chunks(64).enumerate() {
+                let base_idx = group_index * 64;
+                let mut initial_positions = [0usize; 64];
+                for (j, event) in group.iter().enumerate() {
+                    let pos = dedup_hash(event.eid_key) as usize & mask;
+                    initial_positions[j] = pos;
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            table.as_ptr().add(pos) as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+                for (j, event) in group.iter().enumerate() {
+                    let index = base_idx + j;
+                    let loc = ((worker_index as u32) << 27) | index as u32;
+                    let mut pos = initial_positions[j];
+                    loop {
+                        let slot = unsafe { table.get_unchecked_mut(pos) };
+                        if slot.key == 0 {
+                            *slot = DedupSlot { key: event.eid_key, ingest_sec: event.ingest_sec, loc };
+                            occupied.push(pos as u32);
+                            break;
+                        }
+                        if slot.key == event.eid_key {
+                            let earlier = if event.ingest_sec != i32::MIN && slot.ingest_sec != i32::MIN {
+                                event.ingest_sec < slot.ingest_sec
+                            } else {
+                                let current = slot.loc;
+                                let current_worker = (current >> 27) as usize;
+                                let current_index = (current & ((1u32 << 27) - 1)) as usize;
+                                event_ingest_sec(
+                                    &parsed.workers[current_worker].events,
+                                    shard,
+                                    current_index,
+                                ) > event_ingest_sec(&producer.events, shard, index)
+                            };
+                            if earlier {
+                                *slot = DedupSlot { key: event.eid_key, ingest_sec: event.ingest_sec, loc };
+                            }
+                            break;
+                        }
+                        pos = (pos + 1) & mask;
+                    }
+                }
+            }
+        }
+
+        for group in occupied.chunks(64) {
+            let mut keys = [0u64; 64];
+            let mut hashes = [0u64; 64];
+            let mut bloom_words = [0usize; 64];
+            let mut valid = [false; 64];
+            for (j, &position) in group.iter().enumerate() {
+                let slot = unsafe { *table.get_unchecked(position as usize) };
+                let producer_index = (slot.loc >> 27) as usize;
+                let event_index = (slot.loc & ((1u32 << 27) - 1)) as usize;
+                let event = parsed.workers[producer_index].events.buckets[shard][event_index];
+                if event.price_cat_flags & (1 << 30) != 0 {
+                    let hash = mix_key(event.user_key);
+                    let bloom_word = CanonicalMap::bloom_index(hash);
+                    keys[j] = event.user_key;
+                    hashes[j] = hash;
+                    bloom_words[j] = bloom_word;
+                    valid[j] = true;
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            canon_map.bloom.as_ptr().add(bloom_word) as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+            for j in 0..group.len() {
+                if valid[j]
+                    && canon_map.bloom[bloom_words[j]] & (1u64 << (hashes[j] as usize & 63)) != 0
+                {
+                    let slot = canon_map.initial_slot(hashes[j]);
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            canon_map.entries.as_ptr().add(slot) as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+            for (j, &position) in group.iter().enumerate() {
+                if !valid[j] {
+                    continue;
+                }
+                let slot = unsafe { *table.get_unchecked(position as usize) };
+                let producer_index = (slot.loc >> 27) as usize;
+                let event_index = (slot.loc & ((1u32 << 27) - 1)) as usize;
+                let producer = &parsed.workers[producer_index].events;
+                let event = producer.buckets[shard][event_index];
+                let person = canon_map.canonical_hashed(keys[j], hashes[j]);
+                let person_shard = fast_shard(mix_key(person), PERSON_SHARDS);
+                let loc_key = ((shard as u64) << 32) | event_index as u64;
+                let timestamp = if event.ts_off == u32::MAX {
+                    producer.wide_ts[&loc_key]
+                } else {
+                    window_start + event.ts_off as i64
+                };
+                let category_code = ((event.price_cat_flags >> 24) & 0x3f) as u16;
+                let category_id = if category_code == 63 {
+                    producer.wide_category[&loc_key]
+                } else {
+                    category_code
+                };
+                let ts_off = if event.ts_off < META_TAG && category_id < 63 {
+                    event.ts_off
+                } else {
+                    let mut wide = event_meta.lock().expect("wide event metadata");
+                    let index = wide.len();
+                    assert!(index < META_TAG as usize, "too many wide events");
+                    wide.push(WideEventMeta { ts: timestamp, category_id });
+                    META_TAG | index as u32
+                };
+                event_staging.push(
+                    &mut event_outputs,
+                    person_shard,
+                    CleanEvent { person_key: person, ts_off, price_cat_flags: event.price_cat_flags },
+                );
+            }
+        }
+        for &position in &occupied {
+            table[position as usize] = empty_slot;
+        }
+        occupied.clear();
+        event_complete.complete_one();
+    }
+    event_staging.flush(&mut event_outputs);
+    phase_barrier.wait();
+
+    loop {
+        let shard = click_shard_index.fetch_add(1, Ordering::Relaxed);
+        if shard >= DEDUP_SHARDS {
+            break;
+        }
+        let total: usize = parsed.workers.iter().map(|producer| producer.clicks.buckets[shard].len()).sum();
+        let cap = ((total * 3 / 2).next_power_of_two()).max(64);
+        table.resize(cap, empty_slot);
+        let mask = cap - 1;
+        for (worker_index, producer) in parsed.workers.iter().enumerate() {
+            let bucket = &producer.clicks.buckets[shard];
+            for (group_index, group) in bucket.chunks(64).enumerate() {
+                let base_idx = group_index * 64;
+                let mut initial_positions = [0usize; 64];
+                for (j, click) in group.iter().enumerate() {
+                    let pos = dedup_hash(click.click_key) as usize & mask;
+                    initial_positions[j] = pos;
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            table.as_ptr().add(pos) as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+                for (j, click) in group.iter().enumerate() {
+                    let index = base_idx + j;
+                    let loc = ((worker_index as u32) << 27) | index as u32;
+                    let mut pos = initial_positions[j];
+                    loop {
+                        let slot = unsafe { table.get_unchecked_mut(pos) };
+                        if slot.key == 0 {
+                            *slot = DedupSlot { key: click.click_key, ingest_sec: 0, loc };
+                            occupied.push(pos as u32);
+                            break;
+                        }
+                        if slot.key == click.click_key {
+                            break;
+                        }
+                        pos = (pos + 1) & mask;
+                    }
+                }
+            }
+        }
+
+        for group in occupied.chunks(64) {
+            let mut keys = [0u64; 64];
+            let mut hashes = [0u64; 64];
+            let mut bloom_words = [0usize; 64];
+            for (j, &position) in group.iter().enumerate() {
+                let slot = unsafe { *table.get_unchecked(position as usize) };
+                let producer_index = (slot.loc >> 27) as usize;
+                let click_index = (slot.loc & ((1u32 << 27) - 1)) as usize;
+                let click = parsed.workers[producer_index].clicks.buckets[shard][click_index];
+                let hash = mix_key(click.user_key);
+                keys[j] = click.user_key;
+                hashes[j] = hash;
+                bloom_words[j] = CanonicalMap::bloom_index(hash);
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        canon_map.bloom.as_ptr().add(bloom_words[j]) as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+            for j in 0..group.len() {
+                if canon_map.bloom[bloom_words[j]] & (1u64 << (hashes[j] as usize & 63)) != 0 {
+                    let slot = canon_map.initial_slot(hashes[j]);
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            canon_map.entries.as_ptr().add(slot) as *const i8,
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+            for (j, &position) in group.iter().enumerate() {
+                let slot = unsafe { *table.get_unchecked(position as usize) };
+                let producer_index = (slot.loc >> 27) as usize;
+                let click_index = (slot.loc & ((1u32 << 27) - 1)) as usize;
+                let producer = &parsed.workers[producer_index].clicks;
+                let click = producer.buckets[shard][click_index];
+                let person = canon_map.canonical_hashed(keys[j], hashes[j]);
+                let person_shard = fast_shard(mix_key(person), PERSON_SHARDS);
+                let loc_key = ((shard as u64) << 32) | click_index as u64;
+                let timestamp = if click.ts_off == u32::MAX {
+                    producer.wide_ts[&loc_key]
+                } else {
+                    click_start + click.ts_off as i64
+                };
+                let ts_off = if click.ts_off < META_TAG {
+                    click.ts_off
+                } else {
+                    let mut wide = click_meta.lock().expect("wide click metadata");
+                    let index = wide.len();
+                    assert!(index < META_TAG as usize, "too many wide clicks");
+                    wide.push(WideClickMeta(timestamp));
+                    META_TAG | index as u32
+                };
+                click_staging.push(
+                    &mut click_outputs,
+                    person_shard,
+                    CleanClick {
+                        person_key: person,
+                        click_key: click.click_key,
+                        ts_off,
+                        campaign_idx: click.campaign_idx,
+                    },
+                );
+            }
+        }
+        for &position in &occupied {
+            table[position as usize] = empty_slot;
+        }
+        occupied.clear();
+        click_complete.complete_one();
+    }
+    click_staging.flush(&mut click_outputs);
+
+    DedupWorkerData { events: event_outputs, clicks: click_outputs }
+}
+
+fn sessionize_write_worker(
+    worker_id: usize,
+    dedup: &DedupData,
+    worker_count: usize,
+    ids: &IdPool,
+    next_person_shard: &AtomicUsize,
+    window_start: i64,
+    click_start: i64,
+    start_day: i32,
+    num_days: usize,
+    num_cats: usize,
+    num_camps: usize,
+    cat_names: &[String],
+    out_dir: &Path,
+) -> Vec<CampaignDayAgg> {
+    let mut events = Vec::<CleanEvent>::with_capacity(dedup.total_event_rows / PERSON_SHARDS + 64);
+    let mut clicks = Vec::<CleanClick>::with_capacity(dedup.total_click_rows / PERSON_SHARDS + 64);
+    let mut user_rows =
+        UserDailyBuffers::with_capacity(dedup.total_event_rows / worker_count / 8 + 64);
+    let mut camp_agg: Vec<CampaignDayAgg> =
+        (0..num_camps * num_days).map(|_| CampaignDayAgg::default()).collect();
+    let mut assist_stamp = vec![0u32; num_camps];
+    let mut cur_stamp = 0u32;
+    let mut day_acc = vec![(0i64, 0i64, 0i64, false); num_days];
+    let mut day_cat_rev = vec![0i64; num_days * num_cats];
+    let mut touched_days = Vec::with_capacity(num_days);
+    let fast_event_sort = dedup.wide_event_meta.is_empty();
+    let fast_click_sort = dedup.wide_click_meta.is_empty() && dedup.fallback_ids.is_empty();
+
+    loop {
+        let shard = next_person_shard.fetch_add(1, Ordering::Relaxed);
+        if shard >= PERSON_SHARDS {
+            break;
+        }
+        events.clear();
+        clicks.clear();
+        for producer in &dedup.workers {
+            events.extend_from_slice(&producer.events[shard]);
+            clicks.extend_from_slice(&producer.clicks[shard]);
+        }
+        if fast_event_sort {
+            events.sort_unstable_by_key(|event| (event.person_key, event.ts_off));
+        } else {
+            events.sort_unstable_by(|a, b| {
+                a.person_key.cmp(&b.person_key).then_with(|| {
+                    event_timestamp(a, window_start, &dedup.wide_event_meta)
+                        .cmp(&event_timestamp(b, window_start, &dedup.wide_event_meta))
+                })
+            });
+        }
+        if fast_click_sort {
+            clicks.sort_unstable_by_key(|click| (click.person_key, click.ts_off, click.click_key));
+        } else {
+            clicks.sort_unstable_by(|a, b| {
+                a.person_key
+                    .cmp(&b.person_key)
+                    .then_with(|| {
+                        click_timestamp(a, click_start, &dedup.wide_click_meta)
+                            .cmp(&click_timestamp(b, click_start, &dedup.wide_click_meta))
+                    })
+                    .then_with(|| ids.cmp_ids(a.click_key, b.click_key, b'k', b'K'))
+            });
+        }
+
+        let mut event_index = 0usize;
+        let mut click_index = 0usize;
+        while event_index < events.len() {
+            let person = events[event_index].person_key;
+            let mut event_end = event_index + 1;
+            while event_end < events.len() && events[event_end].person_key == person {
+                event_end += 1;
+            }
+            while click_index < clicks.len() && clicks[click_index].person_key < person {
+                click_index += 1;
+            }
+            let mut click_end = click_index;
+            while click_end < clicks.len() && clicks[click_end].person_key == person {
+                click_end += 1;
+            }
+            let person_clicks = &clicks[click_index..click_end];
+            let mut click_left = 0usize;
+            let mut click_right = 0usize;
+            let mut i = event_index;
+            while i < event_end {
+                let session_start = event_timestamp(&events[i], window_start, &dedup.wide_event_meta);
+                let day = session_start.div_euclid(MS_PER_DAY) as i32;
+                let day_index = (day - start_day) as usize;
+                if day_acc[day_index].0 == 0 {
+                    touched_days.push(day_index);
+                }
+                day_acc[day_index].0 += 1;
+                let mut session_events = 0i64;
+                let mut session_revenue = 0i64;
+                let mut has_purchase = false;
+                let mut previous_ts = session_start;
+                while i < event_end
+                    && event_timestamp(&events[i], window_start, &dedup.wide_event_meta) - previous_ts
+                        <= MS_30_MIN
+                {
+                    let event = &events[i];
+                    previous_ts = event_timestamp(event, window_start, &dedup.wide_event_meta);
+                    session_events += 1;
+                    if event.price_cat_flags & (1 << 31) != 0 {
+                        let price = (event.price_cat_flags & 0x00ff_ffff) as i64;
+                        let category = event_category(event, &dedup.wide_event_meta);
+                        session_revenue += price;
+                        has_purchase = true;
+                        day_cat_rev[day_index * num_cats + category] += price;
+                        day_acc[day_index].3 = true;
+                    }
+                    i += 1;
+                }
+                day_acc[day_index].1 += session_events;
+                day_acc[day_index].2 += session_revenue;
+
+                let window_lo = session_start - MS_7_DAYS;
+                while click_right < person_clicks.len()
+                    && click_timestamp(&person_clicks[click_right], click_start, &dedup.wide_click_meta)
+                        <= session_start
+                {
+                    click_right += 1;
+                }
+                while click_left < click_right
+                    && click_timestamp(&person_clicks[click_left], click_start, &dedup.wide_click_meta)
+                        < window_lo
+                {
+                    click_left += 1;
+                }
+                if click_left < click_right {
+                    let best_ts = click_timestamp(
+                        &person_clicks[click_right - 1],
+                        click_start,
+                        &dedup.wide_click_meta,
+                    );
+                    let mut best_index = click_right - 1;
+                    while best_index > click_left
+                        && click_timestamp(
+                            &person_clicks[best_index - 1],
+                            click_start,
+                            &dedup.wide_click_meta,
+                        ) == best_ts
+                    {
+                        best_index -= 1;
+                    }
+                    let credited_campaign = person_clicks[best_index].campaign_idx;
+                    let credited = &mut camp_agg[credited_campaign as usize * num_days + day_index];
+                    credited.sessions += 1;
+                    if has_purchase {
+                        credited.purchasing_sessions += 1;
+                        credited.revenue_cents += session_revenue;
+                    }
+                    cur_stamp = cur_stamp.wrapping_add(1);
+                    if cur_stamp == 0 {
+                        assist_stamp.fill(0);
+                        cur_stamp = 1;
+                    }
+                    for click in &person_clicks[click_left..click_right] {
+                        let campaign = click.campaign_idx as usize;
+                        if assist_stamp[campaign] != cur_stamp {
+                            assist_stamp[campaign] = cur_stamp;
+                            camp_agg[campaign * num_days + day_index].assisted_sessions += 1;
+                        }
+                    }
+                } else {
+                    let organic = &mut camp_agg[day_index];
+                    organic.sessions += 1;
+                    if has_purchase {
+                        organic.purchasing_sessions += 1;
+                        organic.revenue_cents += session_revenue;
+                    }
+                }
+            }
+
+            for &day_index in &touched_days {
+                let day = start_day + day_index as i32;
+                let top_category = if day_acc[day_index].3 {
+                    let mut best_category = 0usize;
+                    let mut best_revenue = -1i64;
+                    for category in 0..num_cats {
+                        let revenue = day_cat_rev[day_index * num_cats + category];
+                        if revenue > 0
+                            && (revenue > best_revenue
+                                || (revenue == best_revenue
+                                    && cat_names[category] < cat_names[best_category]))
+                        {
+                            best_revenue = revenue;
+                            best_category = category;
+                        }
+                    }
+                    Some(best_category as u16)
+                } else {
+                    None
+                };
+                let mut user_id_buffer = [0u8; 11];
+                let user_id = if person >> 63 != 0 {
+                    dedup.fallback_ids[(person & !(1u64 << 63)) as usize].as_ref()
+                } else {
+                    unpack_fast_id(person, b'u', b'U', &mut user_id_buffer)
+                };
+                user_rows.push(
+                    user_id,
+                    day,
+                    day_acc[day_index].0,
+                    day_acc[day_index].1,
+                    day_acc[day_index].2,
+                    top_category.map(|category| cat_names[category as usize].as_bytes()),
+                );
+                day_acc[day_index] = (0, 0, 0, false);
+                day_cat_rev[day_index * num_cats..(day_index + 1) * num_cats].fill(0);
+            }
+            touched_days.clear();
+            event_index = event_end;
+            click_index = click_end;
+        }
+    }
+
+    let columns = user_rows.columns();
+    parquet_writer::write_table(
+        &out_dir.join("user_daily").join(format!("part-{worker_id}.parquet")),
+        user_rows.rows,
+        &columns,
+    )
+    .expect("write user_daily parquet");
+    camp_agg
+}
+
+struct PipelineConfig<'a> {
+    data_dir: &'a Path,
+    out_dir: &'a Path,
+    worker_count: usize,
+    overall_start: std::time::Instant,
+    window_start: i64,
+    window_end: i64,
+    click_start: i64,
+    date_cache: DateCache,
+    prod_fast: &'a [u16],
+    prod_fallback: &'a FxHashMap<Box<[u8]>, u16>,
+    camp_fast: &'a [u16],
+    camp_fallback: &'a FxHashMap<Box<[u8]>, u16>,
+    ids: &'a IdPool,
+    cat_names: &'a [String],
+    camp_names: &'a [String],
+    camp_channels: &'a [String],
+}
+
+fn run_persistent_pipeline(config: PipelineConfig<'_>) -> PipelineTimings {
+    let worker_count = config.worker_count;
+    let link_morsels = mmap_csv_morsels(&config.data_dir.join("links"));
+    let event_morsels = mmap_csv_morsels(&config.data_dir.join("events"));
+    let click_morsels = mmap_csv_morsels(&config.data_dir.join("clicks"));
+    let event_bytes = event_morsels.iter().map(|m| m.len()).sum::<usize>();
+    let click_bytes = click_morsels.iter().map(|m| m.len()).sum::<usize>();
+    let event_bucket_capacity = event_bytes / worker_count / DEDUP_SHARDS / 70;
+    let click_bucket_capacity = click_bytes / worker_count / DEDUP_SHARDS / 70;
+
+    let link_index = AtomicUsize::new(0);
+    let event_index = AtomicUsize::new(0);
+    let click_index = AtomicUsize::new(0);
+    let event_dedup_index = AtomicUsize::new(0);
+    let click_dedup_index = AtomicUsize::new(0);
+    let person_index = AtomicUsize::new(0);
+    let event_parse_complete = CompletionCounter::new(event_morsels.len());
+    let click_parse_complete = CompletionCounter::new(click_morsels.len());
+    let event_dedup_complete = CompletionCounter::new(DEDUP_SHARDS);
+    let click_dedup_complete = CompletionCounter::new(DEDUP_SHARDS);
+
+    let link_pairs: Mutex<Vec<Option<Vec<(u64, u64)>>>> =
+        Mutex::new((0..worker_count).map(|_| None).collect());
+    let parsed_workers: Mutex<Vec<Option<ParseWorkerData>>> =
+        Mutex::new((0..worker_count).map(|_| None).collect());
+    let canonical_shared: Mutex<Option<Arc<CanonicalMap>>> = Mutex::new(None);
+    let parsed_shared: Mutex<Option<Arc<ParsedData>>> = Mutex::new(None);
+    let dedup_workers: Mutex<Vec<Option<DedupWorkerData>>> =
+        Mutex::new((0..worker_count).map(|_| None).collect());
+    let dedup_shared: Mutex<Option<Arc<DedupData>>> = Mutex::new(None);
+    let campaign_results: Mutex<Vec<Option<Vec<CampaignDayAgg>>>> =
+        Mutex::new((0..worker_count).map(|_| None).collect());
+    let wide_event_meta = Mutex::new(Vec::<WideEventMeta>::new());
+    let wide_click_meta = Mutex::new(Vec::<WideClickMeta>::new());
+    let link_timing = Mutex::new(None::<StageTiming>);
+    let event_dedup_start = Mutex::new(None::<std::time::Instant>);
+    let sessionize_start = Mutex::new(None::<std::time::Instant>);
+    let sessionize_finish = Mutex::new(None::<std::time::Instant>);
+    let parse_start = std::time::Instant::now();
+    let link_start = std::time::Instant::now();
+    let barrier1 = Barrier::new(worker_count);
+    let barrier2 = Barrier::new(worker_count);
+    let barrier3 = Barrier::new(worker_count);
+    let event_click_barrier = Barrier::new(worker_count);
+    let session_barrier = Barrier::new(worker_count);
+    let num_cats = config.cat_names.len();
+    let num_camps = config.camp_names.len();
+    let start_day = config.window_start.div_euclid(MS_PER_DAY) as i32;
+    let end_day = (config.window_end - 1).div_euclid(MS_PER_DAY) as i32;
+    let num_days = (end_day - start_day + 1).max(1) as usize;
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_id in 0..worker_count {
+            let link_morsels = &link_morsels;
+            let event_morsels = &event_morsels;
+            let click_morsels = &click_morsels;
+            let link_pairs = &link_pairs;
+            let parsed_workers = &parsed_workers;
+            let canonical_shared = &canonical_shared;
+            let parsed_shared = &parsed_shared;
+            let dedup_workers = &dedup_workers;
+            let dedup_shared = &dedup_shared;
+            let campaign_results = &campaign_results;
+            let wide_event_meta = &wide_event_meta;
+            let wide_click_meta = &wide_click_meta;
+            let link_timing = &link_timing;
+            let event_dedup_start = &event_dedup_start;
+            let sessionize_start = &sessionize_start;
+            let sessionize_finish = &sessionize_finish;
+            let ids = config.ids;
+            let prod_fast = config.prod_fast;
+            let prod_fallback = config.prod_fallback;
+            let camp_fast = config.camp_fast;
+            let camp_fallback = config.camp_fallback;
+            let cat_names = config.cat_names;
+            let camp_names = config.camp_names;
+            let camp_channels = config.camp_channels;
+            let out_dir = config.out_dir;
+            let overall_start = config.overall_start;
+            let window_start = config.window_start;
+            let window_end = config.window_end;
+            let click_start = config.click_start;
+            let date_cache = config.date_cache;
+            let worker_count = config.worker_count;
+            let event_bucket_capacity = event_bucket_capacity;
+            let click_bucket_capacity = click_bucket_capacity;
+            let event_parse_complete = &event_parse_complete;
+            let click_parse_complete = &click_parse_complete;
+            let event_dedup_complete = &event_dedup_complete;
+            let click_dedup_complete = &click_dedup_complete;
+            let event_index = &event_index;
+            let click_index = &click_index;
+            let link_index = &link_index;
+            let event_dedup_index = &event_dedup_index;
+            let click_dedup_index = &click_dedup_index;
+            let person_index = &person_index;
+            let barrier1 = &barrier1;
+            let barrier2 = &barrier2;
+            let barrier3 = &barrier3;
+            let event_click_barrier = &event_click_barrier;
+            let session_barrier = &session_barrier;
+            handles.push(scope.spawn(move || {
+                let mut local_link_pairs = Vec::new();
+                loop {
+                    let chunk_index = link_index.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = link_morsels.get(chunk_index) else { break };
+                    scan_csv_morsel::<2, _>(chunk, |[a, b]| {
+                        if !a.is_empty() && !b.is_empty() {
+                            local_link_pairs.push((ids.key(a, b'u', b'U'), ids.key(b, b'u', b'U')));
+                        }
+                    });
+                }
+                link_pairs.lock().expect("link result slots")[worker_id] = Some(local_link_pairs);
+                barrier1.wait();
+
+                if worker_id == 0 {
+                    let pairs = {
+                        let mut slots = link_pairs.lock().expect("link result slots");
+                        slots.iter_mut().map(|slot| slot.take().expect("link worker result")).collect()
+                    };
+                    let canonical = Arc::new(build_canon_map(pairs, ids));
+                    *canonical_shared.lock().expect("canonical map") = Some(canonical);
+                    let finish = std::time::Instant::now();
+                    *link_timing.lock().expect("links timing") =
+                        Some(stage_timing(link_start, finish, overall_start));
+                }
+
+                let mut event_buckets = (0..DEDUP_SHARDS)
+                    .map(|_| Vec::with_capacity(event_bucket_capacity))
+                    .collect::<Vec<Vec<RawEvent>>>();
+                let mut event_staging = EventStaging::new();
+                let mut wide_ingest = FxHashMap::default();
+                let mut wide_ts = FxHashMap::default();
+                let mut wide_category = FxHashMap::default();
+                let mut click_buckets = (0..DEDUP_SHARDS)
+                    .map(|_| Vec::with_capacity(click_bucket_capacity))
+                    .collect::<Vec<Vec<RawClick>>>();
+                let mut click_wide_ts = FxHashMap::default();
+                let mut local_date_cache = date_cache;
+                let mut buffer_events = true;
+                let mut buffer_clicks = true;
+                while buffer_events || buffer_clicks {
+                    if buffer_events {
+                        let index = event_index.fetch_add(1, Ordering::Relaxed);
+                        if let Some(morsel) = event_morsels.get(index) {
+                            scan_csv_morsel::<7, _>(morsel, |fields| {
+                                parse_event_fields(
+                                    fields,
+                                    window_start,
+                                    window_end,
+                                    prod_fast,
+                                    prod_fallback,
+                                    ids,
+                                    &mut local_date_cache,
+                                    &mut event_buckets,
+                                    &mut event_staging,
+                                    &mut wide_ingest,
+                                    &mut wide_ts,
+                                    &mut wide_category,
+                                );
+                            });
+                            event_parse_complete.complete_one();
+                        } else {
+                            buffer_events = false;
+                        }
+                    }
+                    if buffer_clicks {
+                        let index = click_index.fetch_add(1, Ordering::Relaxed);
+                        if let Some(morsel) = click_morsels.get(index) {
+                            scan_csv_morsel::<4, _>(morsel, |fields| {
+                                parse_click_fields(
+                                    fields,
+                                    click_start,
+                                    window_end,
+                                    camp_fast,
+                                    camp_fallback,
+                                    ids,
+                                    &mut local_date_cache,
+                                    &mut click_buckets,
+                                    &mut click_wide_ts,
+                                );
+                            });
+                            click_parse_complete.complete_one();
+                        } else {
+                            buffer_clicks = false;
+                        }
+                    }
+                }
+                event_staging.flush(&mut event_buckets);
+                parsed_workers.lock().expect("parse result slots")[worker_id] = Some(ParseWorkerData {
+                    events: EventWorkerBuckets {
+                        buckets: event_buckets,
+                        wide_ingest,
+                        wide_ts,
+                        wide_category,
+                    },
+                    clicks: ClickWorkerBuckets { buckets: click_buckets, wide_ts: click_wide_ts },
+                });
+                barrier2.wait();
+
+                if worker_id == 0 {
+                    let producers = {
+                        let mut slots = parsed_workers.lock().expect("parse result slots");
+                        slots.iter_mut().map(|slot| slot.take().expect("parse worker result")).collect::<Vec<_>>()
+                    };
+                    let total_event_rows = producers
+                        .iter()
+                        .flat_map(|producer| producer.events.buckets.iter())
+                        .map(Vec::len)
+                        .sum();
+                    let total_click_rows = producers
+                        .iter()
+                        .flat_map(|producer| producer.clicks.buckets.iter())
+                        .map(Vec::len)
+                        .sum();
+                    *parsed_shared.lock().expect("parsed data") = Some(Arc::new(ParsedData {
+                        workers: producers,
+                        fallback_ids: ids.fallback_snapshot(),
+                        total_event_rows,
+                        total_click_rows,
+                    }));
+                    *event_dedup_start.lock().expect("event dedup start") = Some(std::time::Instant::now());
+                }
+                barrier2.wait();
+
+                let parsed = parsed_shared.lock().expect("parsed data").as_ref().expect("parsed data").clone();
+                let canonical = canonical_shared
+                    .lock()
+                    .expect("canonical map")
+                    .as_ref()
+                    .expect("canonical map")
+                    .clone();
+                let local_dedup = deduplicate_worker(
+                    &parsed,
+                    &canonical,
+                    worker_count,
+                    window_start,
+                    click_start,
+                    event_dedup_index,
+                    click_dedup_index,
+                    event_dedup_complete,
+                    click_dedup_complete,
+                    wide_event_meta,
+                    wide_click_meta,
+                    event_click_barrier,
+                );
+                dedup_workers.lock().expect("dedup result slots")[worker_id] = Some(local_dedup);
+                barrier3.wait();
+
+                if worker_id == 0 {
+                    let producers = {
+                        let mut slots = dedup_workers.lock().expect("dedup result slots");
+                        slots.iter_mut().map(|slot| slot.take().expect("dedup worker result")).collect()
+                    };
+                    let event_meta = std::mem::take(&mut *wide_event_meta.lock().expect("wide event metadata"));
+                    let click_meta = std::mem::take(&mut *wide_click_meta.lock().expect("wide click metadata"));
+                    *dedup_shared.lock().expect("dedup data") = Some(Arc::new(DedupData {
+                        workers: producers,
+                        wide_event_meta: event_meta,
+                        wide_click_meta: click_meta,
+                        fallback_ids: parsed.fallback_ids.clone(),
+                        total_event_rows: parsed.total_event_rows,
+                        total_click_rows: parsed.total_click_rows,
+                    }));
+                    *sessionize_start.lock().expect("sessionize start") = Some(std::time::Instant::now());
+                }
+                barrier3.wait();
+
+                let dedup = dedup_shared.lock().expect("dedup data").as_ref().expect("dedup data").clone();
+                let camp_agg = sessionize_write_worker(
+                    worker_id,
+                    &dedup,
+                    worker_count,
+                    ids,
+                    person_index,
+                    window_start,
+                    click_start,
+                    start_day,
+                    num_days,
+                    num_cats,
+                    num_camps,
+                    cat_names,
+                    out_dir,
+                );
+                campaign_results.lock().expect("campaign result slots")[worker_id] = Some(camp_agg);
+                session_barrier.wait();
+
+                if worker_id == 0 {
+                    let mut final_campaigns: FxHashMap<(u16, i32), CampaignDayAgg> = FxHashMap::default();
+                    let mut slots = campaign_results.lock().expect("campaign result slots");
+                    for campaign_agg in slots.iter_mut() {
+                        let values = campaign_agg.take().expect("campaign worker result");
+                        for (index, value) in values.into_iter().enumerate() {
+                            if value.sessions != 0 || value.assisted_sessions != 0 {
+                                let campaign = index / num_days;
+                                let day = start_day + (index % num_days) as i32;
+                                let entry = final_campaigns.entry((campaign as u16, day)).or_default();
+                                entry.sessions += value.sessions;
+                                entry.purchasing_sessions += value.purchasing_sessions;
+                                entry.revenue_cents += value.revenue_cents;
+                                entry.assisted_sessions += value.assisted_sessions;
+                            }
+                        }
+                    }
+                    write_campaign_daily(
+                        &out_dir.join("campaign_daily"),
+                        &final_campaigns,
+                        camp_names,
+                        camp_channels,
+                    );
+                    *sessionize_finish.lock().expect("sessionize finish") = Some(std::time::Instant::now());
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("pipeline worker");
+        }
+    });
+
+    let mut timings = PipelineTimings::default();
+    timings.links = link_timing.lock().expect("links timing").unwrap_or_default();
+    let event_parse_finish = event_parse_complete.finished_at();
+    timings.events_parse = stage_timing(parse_start, event_parse_finish, config.overall_start);
+    let event_dedup_finish = event_dedup_complete.finished_at();
+    let event_dedup_begin = event_dedup_start.lock().expect("event dedup start").unwrap_or(event_dedup_finish);
+    timings.events_dedup = stage_timing(event_dedup_begin, event_dedup_finish, config.overall_start);
+    let click_parse_finish = click_parse_complete.finished_at();
+    let click_dedup_finish = click_dedup_complete.finished_at();
+    let click_dedup_elapsed = click_dedup_finish.saturating_duration_since(event_dedup_finish);
+    timings.clicks.elapsed =
+        click_parse_finish.saturating_duration_since(parse_start) + click_dedup_elapsed;
+    timings.clicks.cumulative = click_dedup_finish.saturating_duration_since(config.overall_start);
+    let sessionize_begin = sessionize_start.lock().expect("sessionize start").unwrap_or(click_dedup_finish);
+    let sessionize_end = sessionize_finish.lock().expect("sessionize finish").unwrap_or_else(std::time::Instant::now);
+    timings.sessionize_write = stage_timing(sessionize_begin, sessionize_end, config.overall_start);
+    timings
+}
+
+#[cfg(any())]
+fn legacy_main() {
     let t_start = std::time::Instant::now();
     let mut t = std::time::Instant::now();
     let data_dir = PathBuf::from(env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out_dir = PathBuf::from(env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    if let Ok(ncpu) = env::var("NCPU").and_then(|s| s.parse::<usize>().map_err(|_| env::VarError::NotPresent)) {
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global();
-    }
     let worker_count = env::var("NCPU")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| rayon::current_num_threads());
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |count| count.get()));
 
     // 1. Manifest
     let manifest_str = fs::read_to_string(data_dir.join("manifest.json")).expect("read manifest");
@@ -2208,7 +3084,7 @@ fn main() {
     // 8. Merge & Write Parquet
     fs::create_dir_all(out_dir.join("user_daily")).expect("create user_daily dir");
     let fallback_ids = ids.fallback_snapshot();
-    (0..8).into_par_iter().for_each(|part| {
+    for part in 0..8 {
         let start = part * shard_results.len() / 8;
         let end = ((part + 1) * shard_results.len() / 8).min(shard_results.len());
         let slices: Vec<&[UserDayRow]> = shard_results[start..end]
@@ -2216,7 +3092,7 @@ fn main() {
             .map(|(rows, _)| rows.as_slice())
             .collect();
         write_user_daily_shard(&out_dir.join("user_daily"), part, &slices, &cat_names, &fallback_ids);
-    });
+    }
 
     let mut final_camp: FxHashMap<(u16, i32), CampaignDayAgg> = FxHashMap::default();
     for (_, ca) in shard_results {
@@ -2239,73 +3115,99 @@ fn main() {
     std::process::exit(0);
 }
 
-fn write_user_daily_shard(
-    dir: &Path,
-    shard: usize,
-    row_slices: &[&[UserDayRow]],
-    cat_names: &[String],
-    fallback_ids: &[Box<[u8]>],
-) {
-    fs::create_dir_all(dir).expect("create user_daily dir");
-    let rows_len: usize = row_slices.iter().map(|rows| rows.len()).sum();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
+fn main() {
+    let overall_start = std::time::Instant::now();
+    let data_dir = PathBuf::from(env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
+    let out_dir = PathBuf::from(env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
+    let worker_count = env::var("NCPU")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |count| count.get()));
 
-    let mut uid_b = StringBuilder::with_capacity(rows_len, rows_len * 12);
-    let mut day_b = Date32Builder::with_capacity(rows_len);
-    let mut ses_b = Int64Builder::with_capacity(rows_len);
-    let mut ev_b = Int64Builder::with_capacity(rows_len);
-    let mut rev_b = Int64Builder::with_capacity(rows_len);
-    let mut cat_b = StringBuilder::with_capacity(rows_len, rows_len * 8);
+    let manifest_str = fs::read_to_string(data_dir.join("manifest.json")).expect("read manifest");
+    let manifest: Manifest = serde_json::from_str(&manifest_str).expect("parse manifest");
+    let window_start = parse_ts(manifest.window_start.as_bytes()).expect("window_start");
+    let window_end = parse_ts(manifest.window_end.as_bytes()).expect("window_end");
+    let click_start = window_start - MS_7_DAYS;
+    let date_cache = DateCache::new(window_start, window_end);
 
-    for rows in row_slices {
-        for r in *rows {
-            let mut uid_buf = [0u8; 11];
-            let uid = if r.user_key >> 63 != 0 {
-                fallback_ids[(r.user_key & !(1u64 << 63)) as usize].as_ref()
+    let mut cat_names = vec!["unknown".to_string()];
+    let mut cat_map: FxHashMap<String, u16> = FxHashMap::default();
+    cat_map.insert("unknown".to_string(), 0);
+    let mut prod_fast = vec![0u16; 65_536];
+    let mut prod_fallback: FxHashMap<Box<[u8]>, u16> = FxHashMap::default();
+    for_each_data_line(&data_dir.join("products.csv"), |line| {
+        if let Some([product, category]) = parse_csv_line::<2>(line) {
+            let category_name = std::str::from_utf8(category).unwrap_or("unknown");
+            let category_id = if let Some(&known) = cat_map.get(category_name) {
+                known
             } else {
-                unpack_fast_id(r.user_key, b'u', b'U', &mut uid_buf)
+                let id = cat_names.len() as u16;
+                cat_names.push(category_name.to_string());
+                cat_map.insert(category_name.to_string(), id);
+                id
             };
-            uid_b.append_value(std::str::from_utf8(uid).expect("utf8 uid"));
-            day_b.append_value(r.day);
-            ses_b.append_value(r.sessions);
-            ev_b.append_value(r.events);
-            rev_b.append_value(r.revenue_cents);
-            match r.top_category {
-                Some(c) => cat_b.append_value(&cat_names[c as usize]),
-                None => cat_b.append_null(),
+            if let Some(index) = parse_numeric_id(product, b"p", 65_535) {
+                prod_fast[index] = category_id;
+            } else {
+                prod_fallback.insert(product.into(), category_id);
             }
         }
-    }
+    });
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(uid_b.finish()),
-            Arc::new(day_b.finish()),
-            Arc::new(ses_b.finish()),
-            Arc::new(ev_b.finish()),
-            Arc::new(rev_b.finish()),
-            Arc::new(cat_b.finish()),
-        ],
-    )
-    .expect("user_daily batch");
+    let mut camp_names = vec!["organic".to_string()];
+    let mut camp_channels = vec!["organic".to_string()];
+    let mut camp_fast = vec![0u16; 4_096];
+    let mut camp_fallback: FxHashMap<Box<[u8]>, u16> = FxHashMap::default();
+    for_each_data_line(&data_dir.join("campaigns.csv"), |line| {
+        if let Some([campaign, channel]) = parse_csv_line::<2>(line) {
+            let index = camp_names.len() as u16;
+            camp_names.push(String::from_utf8_lossy(campaign).into_owned());
+            camp_channels.push(String::from_utf8_lossy(channel).into_owned());
+            if let Some(id) = parse_numeric_id(campaign, b"c_", 4_095) {
+                camp_fast[id] = index;
+            } else {
+                camp_fallback.insert(campaign.into(), index);
+            }
+        }
+    });
 
-    let file = File::create(dir.join(format!("part-{shard}.parquet"))).expect("create user_daily parquet");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_statistics_enabled(EnabledStatistics::None)
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("arrow writer");
-    writer.write(&batch).expect("write user_daily");
-    writer.close().expect("close user_daily");
+    let ids = IdPool::new();
+    let timings = run_persistent_pipeline(PipelineConfig {
+        data_dir: &data_dir,
+        out_dir: &out_dir,
+        worker_count,
+        overall_start,
+        window_start,
+        window_end,
+        click_start,
+        date_cache,
+        prod_fast: &prod_fast,
+        prod_fallback: &prod_fallback,
+        camp_fast: &camp_fast,
+        camp_fallback: &camp_fallback,
+        ids: &ids,
+        cat_names: &cat_names,
+        camp_names: &camp_names,
+        camp_channels: &camp_channels,
+    });
+    eprintln!("links: {:?} cumulative: {:?}", timings.links.elapsed, timings.links.cumulative);
+    eprintln!(
+        "events_parse: {:?} cumulative: {:?}",
+        timings.events_parse.elapsed, timings.events_parse.cumulative
+    );
+    eprintln!(
+        "events_dedup: {:?} cumulative: {:?}",
+        timings.events_dedup.elapsed, timings.events_dedup.cumulative
+    );
+    eprintln!("clicks: {:?} cumulative: {:?}", timings.clicks.elapsed, timings.clicks.cumulative);
+    eprintln!(
+        "sessionize_write: {:?} cumulative: {:?}",
+        timings.sessionize_write.elapsed, timings.sessionize_write.cumulative
+    );
+    eprintln!("total: {:?}", overall_start.elapsed());
+    std::process::exit(0);
 }
 
 fn write_campaign_daily(
@@ -2314,57 +3216,81 @@ fn write_campaign_daily(
     camp_names: &[String],
     camp_channels: &[String],
 ) {
-    fs::create_dir_all(dir).expect("create campaign_daily dir");
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("campaign_id", DataType::Utf8, false),
-        Field::new("channel", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("purchasing_sessions", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("assisted_sessions", DataType::Int64, false),
-    ]));
-
     let n = agg.len();
-    let mut cid_b = StringBuilder::with_capacity(n, n * 8);
-    let mut ch_b = StringBuilder::with_capacity(n, n * 8);
-    let mut day_b = Date32Builder::with_capacity(n);
-    let mut ses_b = Int64Builder::with_capacity(n);
-    let mut pses_b = Int64Builder::with_capacity(n);
-    let mut rev_b = Int64Builder::with_capacity(n);
-    let mut ast_b = Int64Builder::with_capacity(n);
+    let mut campaign_ids = Vec::with_capacity(n * 12);
+    let mut channels = Vec::with_capacity(n * 12);
+    let mut days = Vec::with_capacity(n * 4);
+    let mut sessions = Vec::with_capacity(n * 8);
+    let mut purchasing_sessions = Vec::with_capacity(n * 8);
+    let mut revenue = Vec::with_capacity(n * 8);
+    let mut assisted_sessions = Vec::with_capacity(n * 8);
 
     for (&(cidx, day), v) in agg {
-        cid_b.append_value(&camp_names[cidx as usize]);
-        ch_b.append_value(&camp_channels[cidx as usize]);
-        day_b.append_value(day);
-        ses_b.append_value(v.sessions);
-        pses_b.append_value(v.purchasing_sessions);
-        rev_b.append_value(v.revenue_cents);
-        ast_b.append_value(v.assisted_sessions);
+        append_plain_byte_array(&mut campaign_ids, camp_names[cidx as usize].as_bytes());
+        append_plain_byte_array(&mut channels, camp_channels[cidx as usize].as_bytes());
+        days.extend_from_slice(&day.to_le_bytes());
+        sessions.extend_from_slice(&v.sessions.to_le_bytes());
+        purchasing_sessions.extend_from_slice(&v.purchasing_sessions.to_le_bytes());
+        revenue.extend_from_slice(&v.revenue_cents.to_le_bytes());
+        assisted_sessions.extend_from_slice(&v.assisted_sessions.to_le_bytes());
     }
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(cid_b.finish()),
-            Arc::new(ch_b.finish()),
-            Arc::new(day_b.finish()),
-            Arc::new(ses_b.finish()),
-            Arc::new(pses_b.finish()),
-            Arc::new(rev_b.finish()),
-            Arc::new(ast_b.finish()),
-        ],
+    use parquet_writer::PhysicalType::{ByteArray, Int32, Int64};
+    let columns = [
+        parquet_writer::Column {
+            name: "campaign_id",
+            physical_type: ByteArray,
+            converted_type: Some(0),
+            values: &campaign_ids,
+            definition_levels: None,
+        },
+        parquet_writer::Column {
+            name: "channel",
+            physical_type: ByteArray,
+            converted_type: Some(0),
+            values: &channels,
+            definition_levels: None,
+        },
+        parquet_writer::Column {
+            name: "day",
+            physical_type: Int32,
+            converted_type: Some(6),
+            values: &days,
+            definition_levels: None,
+        },
+        parquet_writer::Column {
+            name: "sessions",
+            physical_type: Int64,
+            converted_type: None,
+            values: &sessions,
+            definition_levels: None,
+        },
+        parquet_writer::Column {
+            name: "purchasing_sessions",
+            physical_type: Int64,
+            converted_type: None,
+            values: &purchasing_sessions,
+            definition_levels: None,
+        },
+        parquet_writer::Column {
+            name: "revenue_cents",
+            physical_type: Int64,
+            converted_type: None,
+            values: &revenue,
+            definition_levels: None,
+        },
+        parquet_writer::Column {
+            name: "assisted_sessions",
+            physical_type: Int64,
+            converted_type: None,
+            values: &assisted_sessions,
+            definition_levels: None,
+        },
+    ];
+    parquet_writer::write_table(
+        &dir.join("part-0.parquet"),
+        n,
+        &columns,
     )
-    .expect("campaign_daily batch");
-
-    let file = File::create(dir.join("part-0.parquet")).expect("create campaign_daily parquet");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_statistics_enabled(EnabledStatistics::None)
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("arrow writer");
-    writer.write(&batch).expect("write campaign_daily");
-    writer.close().expect("close campaign_daily");
+    .expect("write campaign_daily parquet");
 }
