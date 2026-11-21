@@ -5,15 +5,18 @@ use memchr::memchr;
 use memmap2::Mmap;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use std::env;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const MS_PER_DAY: i64 = 86_400_000;
 const MS_30_MIN: i64 = 1_800_000;
@@ -27,10 +30,8 @@ struct Manifest {
 }
 
 #[inline]
-fn fast_hash(bytes: &[u8]) -> u64 {
-    let mut h = rustc_hash::FxHasher::default();
-    bytes.hash(&mut h);
-    h.finish()
+fn fast_hash(bytes: &[u8]) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(bytes)
 }
 
 #[inline]
@@ -216,7 +217,8 @@ fn for_each_data_line<F: FnMut(&[u8])>(path: &Path, mut f: F) {
         return;
     }
     let mmap = unsafe { Mmap::map(&file).expect("mmap failed") };
-    let data = &mmap[..];
+    let mmap = Box::leak(Box::new(mmap));
+    let data: &[u8] = &mmap[..];
     // Skip header line
     let mut pos = match memchr(b'\n', data) {
         Some(i) => i + 1,
@@ -234,6 +236,40 @@ fn for_each_data_line<F: FnMut(&[u8])>(path: &Path, mut f: F) {
             }
         }
     }
+}
+
+fn mmap_data(path: &Path) -> Option<&'static [u8]> {
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() == 0 {
+        return None;
+    }
+    let mmap = unsafe { Mmap::map(&file).expect("mmap failed") };
+    let mmap = Box::leak(Box::new(mmap));
+    Some(&mmap[..])
+}
+
+fn morsels(data: &'static [u8]) -> Vec<(&'static [u8], bool)> {
+    const MORSEL: usize = 4 * 1024 * 1024;
+    let mut out = Vec::new();
+    let mut pos = match memchr(b'\n', data) {
+        Some(i) => i + 1,
+        None => return out,
+    };
+    let mut first = true;
+    while pos < data.len() {
+        let target = pos.saturating_add(MORSEL);
+        let end = if target >= data.len() {
+            data.len()
+        } else if let Some(rel) = memchr(b'\n', &data[target..]) {
+            target + rel + 1
+        } else {
+            data.len()
+        };
+        out.push((&data[pos..end], first));
+        first = false;
+        pos = end;
+    }
+    out
 }
 
 // Union-Find tracking byte-wise smallest user_id per component
@@ -306,25 +342,25 @@ impl Dsu {
 
 struct RawEvent {
     ingest_ts: i64,
-    valid: bool,
-    user_id: Box<[u8]>,
     ts: i64,
+    event_id: &'static [u8],
+    user_id: &'static [u8],
     price_cents: u32,
     category_id: u16,
-    is_purchase: bool,
+    flags: u8,
 }
 
 struct CleanEvent {
     ts: i64,
     price_cents: u32,
     category_id: u16,
-    is_purchase: bool,
+    flags: u8,
 }
 
 struct CleanClick {
     ts: i64,
     campaign_idx: u16,
-    click_id: Box<[u8]>,
+    click_id: &'static [u8],
 }
 
 #[derive(Default, Clone)]
@@ -407,27 +443,34 @@ fn main() {
     let canon_map = dsu.finalize();
 
     // 5. Events: parallel parse & local shard, then parallel dedup
-    let event_files = list_csvs(&data_dir.join("events"));
-    let event_shards: Vec<Vec<(Box<[u8]>, RawEvent)>> = event_files
+    let event_morsels: Vec<&'static [u8]> = list_csvs(&data_dir.join("events"))
+        .iter()
+        .filter_map(|path| mmap_data(path))
+        .flat_map(|data| morsels(data).into_iter().map(|(m, _)| m))
+        .collect();
+    let event_shards: Vec<Vec<(u128, RawEvent)>> = event_morsels
         .par_iter()
         .fold(
             || (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(),
-            |mut acc, path| {
-                for_each_data_line(path, |line| {
+            |mut acc, &morsel| {
+                let mut pos = 0;
+                while pos < morsel.len() {
+                    let rel = memchr(b'\n', &morsel[pos..]).unwrap_or(morsel.len() - pos);
+                    let line = &morsel[pos..pos + rel];
+                    pos += rel + 1;
                     let Some([eid, uid, ts_b, ing_b, etype, pid, price_b]) = parse_csv_line::<7>(line) else {
-                        return;
+                        continue;
                     };
                     if eid.is_empty() {
-                        return;
+                        continue;
                     }
                     let Some(ingest_ts) = parse_ts(ing_b) else {
-                        return;
+                        continue;
                     };
-                    let mut valid = false;
+                    let mut flags = 0u8;
                     let mut ts = 0;
                     let mut price_cents = 0;
                     let mut category_id = 0;
-                    let mut is_purchase = false;
 
                     if !uid.is_empty() && !pid.is_empty() {
                         if let Some(parsed_ts) = parse_ts(ts_b) {
@@ -437,15 +480,14 @@ fn main() {
                             {
                                 match etype {
                                     b"view" | b"cart" => {
-                                        valid = true;
+                                        flags = 1;
                                         ts = parsed_ts;
                                     }
                                     b"purchase" => {
                                         if let Some(p) = parse_price(price_b) {
-                                            valid = true;
+                                            flags = 3;
                                             ts = parsed_ts;
                                             price_cents = p;
-                                            is_purchase = true;
                                             category_id = *prod_to_cat.get(pid).unwrap_or(&0);
                                         }
                                     }
@@ -455,20 +497,21 @@ fn main() {
                         }
                     }
 
-                    let shard = (fast_hash(eid) as usize) & (NUM_SHARDS - 1);
+                    let key = fast_hash(eid);
+                    let shard = (key as usize) & (NUM_SHARDS - 1);
                     acc[shard].push((
-                        eid.into(),
+                        key,
                         RawEvent {
                             ingest_ts,
-                            valid,
-                            user_id: if valid { uid.into() } else { Box::new([]) },
                             ts,
+                            event_id: eid,
+                            user_id: if flags & 1 != 0 { uid } else { &[] },
                             price_cents,
                             category_id,
-                            is_purchase,
+                            flags,
                         },
                     ));
-                });
+                }
                 acc
             },
         )
@@ -486,37 +529,37 @@ fn main() {
     let person_event_shards: Vec<Vec<(Box<[u8]>, CleanEvent)>> = event_shards
         .into_par_iter()
         .map(|shard_vec| {
-            let mut dedup: FxHashMap<Box<[u8]>, RawEvent> =
+            let mut dedup: FxHashMap<u128, Vec<RawEvent>> =
                 FxHashMap::with_capacity_and_hasher(shard_vec.len(), Default::default());
-            for (eid, ev) in shard_vec {
-                match dedup.entry(eid) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(ev);
+            for (key, ev) in shard_vec {
+                let bucket = dedup.entry(key).or_default();
+                if let Some(existing) = bucket.iter_mut().find(|old| old.event_id == ev.event_id) {
+                    if ev.ingest_ts < existing.ingest_ts {
+                        *existing = ev;
                     }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if ev.ingest_ts < entry.get().ingest_ts {
-                            entry.insert(ev);
-                        }
-                    }
+                } else {
+                    bucket.push(ev);
                 }
             }
             let mut out = (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>();
-            for (_, ev) in dedup {
-                if ev.valid {
-                    let person: Box<[u8]> = canon_map
-                        .get(&ev.user_id)
-                        .cloned()
-                        .unwrap_or(ev.user_id);
-                    let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
-                    out[s].push((
-                        person,
-                        CleanEvent {
-                            ts: ev.ts,
-                            price_cents: ev.price_cents,
-                            category_id: ev.category_id,
-                            is_purchase: ev.is_purchase,
-                        },
-                    ));
+            for bucket in dedup.into_values() {
+                for ev in bucket {
+                    if ev.flags & 1 != 0 {
+                        let person: Box<[u8]> = canon_map
+                            .get(ev.user_id)
+                            .cloned()
+                            .unwrap_or_else(|| ev.user_id.into());
+                        let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
+                        out[s].push((
+                            person,
+                            CleanEvent {
+                                ts: ev.ts,
+                                price_cents: ev.price_cents,
+                                category_id: ev.category_id,
+                                flags: ev.flags,
+                            },
+                        ));
+                    }
                 }
             }
             out
@@ -532,31 +575,40 @@ fn main() {
         );
 
     // 6. Clicks: parallel parse, dedup & repartition by canonical person
-    let click_files = list_csvs(&data_dir.join("clicks"));
-    let click_shards: Vec<Vec<(Box<[u8]>, Box<[u8]>, i64, u16)>> = click_files
+    let click_morsels: Vec<&'static [u8]> = list_csvs(&data_dir.join("clicks"))
+        .iter()
+        .filter_map(|path| mmap_data(path))
+        .flat_map(|data| morsels(data).into_iter().map(|(m, _)| m))
+        .collect();
+    let click_shards: Vec<Vec<(u128, &'static [u8], &'static [u8], i64, u16)>> = click_morsels
         .par_iter()
         .fold(
             || (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(),
-            |mut acc, path| {
-                for_each_data_line(path, |line| {
+            |mut acc, &morsel| {
+                let mut pos = 0;
+                while pos < morsel.len() {
+                    let rel = memchr(b'\n', &morsel[pos..]).unwrap_or(morsel.len() - pos);
+                    let line = &morsel[pos..pos + rel];
+                    pos += rel + 1;
                     let Some([cid, uid, camp_b, ts_b]) = parse_csv_line::<4>(line) else {
-                        return;
+                        continue;
                     };
                     if cid.is_empty() || uid.is_empty() {
-                        return;
+                        continue;
                     }
                     let Some(&camp_idx) = camp_map.get(camp_b) else {
-                        return;
+                        continue;
                     };
                     let Some(ts) = parse_ts(ts_b) else {
-                        return;
+                        continue;
                     };
                     if ts < click_start || ts >= window_end {
-                        return;
+                        continue;
                     }
-                    let s = (fast_hash(cid) as usize) & (NUM_SHARDS - 1);
-                    acc[s].push((cid.into(), uid.into(), ts, camp_idx));
-                });
+                    let key = fast_hash(cid);
+                    let s = (key as usize) & (NUM_SHARDS - 1);
+                    acc[s].push((key, cid, uid, ts, camp_idx));
+                }
                 acc
             },
         )
@@ -573,23 +625,28 @@ fn main() {
     let person_click_shards: Vec<Vec<(Box<[u8]>, CleanClick)>> = click_shards
         .into_par_iter()
         .map(|shard_vec| {
-            let mut dedup: FxHashMap<Box<[u8]>, (Box<[u8]>, i64, u16)> =
+            let mut dedup: FxHashMap<u128, Vec<(&'static [u8], &'static [u8], i64, u16)>> =
                 FxHashMap::with_capacity_and_hasher(shard_vec.len(), Default::default());
-            for (cid, uid, ts, camp_idx) in shard_vec {
-                dedup.entry(cid).or_insert((uid, ts, camp_idx));
+            for (key, cid, uid, ts, camp_idx) in shard_vec {
+                let bucket = dedup.entry(key).or_default();
+                if !bucket.iter().any(|(old_cid, _, _, _)| *old_cid == cid) {
+                    bucket.push((cid, uid, ts, camp_idx));
+                }
             }
             let mut out = (0..NUM_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>();
-            for (cid, (uid, ts, camp_idx)) in dedup {
-                let person: Box<[u8]> = canon_map.get(&uid).cloned().unwrap_or(uid);
-                let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
-                out[s].push((
-                    person,
-                    CleanClick {
-                        ts,
-                        campaign_idx: camp_idx,
-                        click_id: cid,
-                    },
-                ));
+            for bucket in dedup.into_values() {
+                for (cid, uid, ts, camp_idx) in bucket {
+                    let person: Box<[u8]> = canon_map.get(uid).cloned().unwrap_or_else(|| uid.into());
+                    let s = (fast_hash(&person) as usize) & (NUM_SHARDS - 1);
+                    out[s].push((
+                        person,
+                        CleanClick {
+                            ts,
+                            campaign_idx: camp_idx,
+                            click_id: cid,
+                        },
+                    ));
+                }
             }
             out
         })
@@ -667,7 +724,7 @@ fn main() {
                             let ev = &events[i];
                             prev_ts = ev.ts;
                             sess_events += 1;
-                            if ev.is_purchase {
+                            if ev.flags & 2 != 0 {
                                 let p = ev.price_cents as i64;
                                 sess_rev += p;
                                 sess_has_purchase = true;
@@ -762,10 +819,21 @@ fn main() {
             .collect();
 
     // 8. Merge & Write Parquet
+    fs::create_dir_all(out_dir.join("user_daily")).expect("create user_daily dir");
+    shard_results
+        .par_iter()
+        .enumerate()
+        .for_each(|(shard, (rows, _))| {
+            write_user_daily_shard(
+                &out_dir.join("user_daily"),
+                shard,
+                rows,
+                &cat_names,
+            );
+        });
+
     let mut final_camp: FxHashMap<(u16, i32), CampaignDayAgg> = FxHashMap::default();
-    let mut all_user_rows: Vec<UserDayRow> = Vec::new();
-    for (mut ur, ca) in shard_results {
-        all_user_rows.append(&mut ur);
+    for (_, ca) in shard_results {
         for (k, v) in ca {
             let e = final_camp.entry(k).or_default();
             e.sessions += v.sessions;
@@ -775,11 +843,11 @@ fn main() {
         }
     }
 
-    write_user_daily(&out_dir.join("user_daily"), &all_user_rows, &cat_names);
     write_campaign_daily(&out_dir.join("campaign_daily"), &final_camp, &camp_names, &camp_channels);
+    std::process::exit(0);
 }
 
-fn write_user_daily(dir: &Path, rows: &[UserDayRow], cat_names: &[String]) {
+fn write_user_daily_shard(dir: &Path, shard: usize, rows: &[UserDayRow], cat_names: &[String]) {
     fs::create_dir_all(dir).expect("create user_daily dir");
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
@@ -822,8 +890,12 @@ fn write_user_daily(dir: &Path, rows: &[UserDayRow], cat_names: &[String]) {
     )
     .expect("user_daily batch");
 
-    let file = File::create(dir.join("part-0.parquet")).expect("create user_daily parquet");
-    let props = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
+    let file = File::create(dir.join(format!("part-{shard}.parquet"))).expect("create user_daily parquet");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_dictionary_enabled(false)
+        .build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("arrow writer");
     writer.write(&batch).expect("write user_daily");
     writer.close().expect("close user_daily");
@@ -880,7 +952,11 @@ fn write_campaign_daily(
     .expect("campaign_daily batch");
 
     let file = File::create(dir.join("part-0.parquet")).expect("create campaign_daily parquet");
-    let props = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_dictionary_enabled(false)
+        .build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("arrow writer");
     writer.write(&batch).expect("write campaign_daily");
     writer.close().expect("close campaign_daily");
